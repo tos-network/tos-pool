@@ -83,6 +83,16 @@ func ValidateHash(hash string) bool {
 	return IsValidHex(hash)
 }
 
+// Int64ToHex converts int64 to hex string with 0x prefix
+func Int64ToHex(n int64) string {
+	return fmt.Sprintf("0x%x", n)
+}
+
+// Uint64ToHex converts uint64 to hex string with 0x prefix
+func Uint64ToHex(n uint64) string {
+	return fmt.Sprintf("0x%x", n)
+}
+
 // ValidateAddress validates TOS address format
 func ValidateAddress(addr string) bool {
 	// TOS addresses start with "tos1" and are 62 characters (bech32)

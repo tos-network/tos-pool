@@ -12,7 +12,9 @@ import (
 	"github.com/tos-network/tos-pool/internal/api"
 	"github.com/tos-network/tos-pool/internal/config"
 	"github.com/tos-network/tos-pool/internal/master"
+	"github.com/tos-network/tos-pool/internal/newrelic"
 	"github.com/tos-network/tos-pool/internal/policy"
+	"github.com/tos-network/tos-pool/internal/profiling"
 	"github.com/tos-network/tos-pool/internal/rpc"
 	"github.com/tos-network/tos-pool/internal/slave"
 	"github.com/tos-network/tos-pool/internal/storage"
@@ -81,14 +83,34 @@ func main() {
 
 	var masterCoord *master.Master
 	var stratum *slave.StratumServer
+	var wsServer *slave.WebSocketServer
+	var xatumServer *slave.XatumServer
 	var apiServer *api.Server
 	var policyServer *policy.PolicyServer
+	var pprofServer *profiling.Server
+	var nrAgent *newrelic.Agent
 
 	// Initialize policy server for security
 	policyConfig := policy.DefaultConfig()
 	// TODO: Load policy config from config file
 	policyServer = policy.NewPolicyServer(policyConfig, redis)
 	policyServer.Start()
+
+	// Start pprof profiling server if enabled
+	if cfg.Profiling.Enabled {
+		pprofServer = profiling.NewServer(&cfg.Profiling)
+		if err := pprofServer.Start(); err != nil {
+			util.Errorf("Failed to start pprof server: %v", err)
+		}
+	}
+
+	// Initialize New Relic APM if enabled
+	if cfg.NewRelic.Enabled {
+		nrAgent = newrelic.NewAgent(&cfg.NewRelic)
+		if err := nrAgent.Start(); err != nil {
+			util.Errorf("Failed to start New Relic agent: %v", err)
+		}
+	}
 
 	// Start master if enabled
 	if cfg.Master.Enabled {
@@ -128,10 +150,8 @@ func main() {
 
 	// Start slave (stratum server) if enabled
 	if cfg.Slave.Enabled {
-		stratum = slave.NewStratumServer(cfg, policyServer)
-
-		// Set callbacks
-		stratum.SetShareCallback(func(share *slave.Share) {
+		// Share callback for all mining protocols
+		shareCallback := func(share *slave.Share) {
 			if masterCoord != nil {
 				submission := &master.ShareSubmission{
 					Address:    share.Address,
@@ -143,13 +163,38 @@ func main() {
 				}
 				masterCoord.SubmitShare(submission)
 			}
-		})
+			// Record share in New Relic
+			if nrAgent != nil {
+				nrAgent.RecordShareSubmission(share.Address, share.Worker, share.Difficulty, true)
+			}
+		}
 
+		// Start Stratum server
+		stratum = slave.NewStratumServer(cfg, policyServer)
+		stratum.SetShareCallback(shareCallback)
 		if err := stratum.Start(); err != nil {
 			util.Fatalf("Failed to start stratum server: %v", err)
 		}
 
-		// Broadcast jobs from master to stratum
+		// Start WebSocket GetWork server if enabled
+		if cfg.Slave.WebSocketEnabled {
+			wsServer = slave.NewWebSocketServer(cfg, policyServer)
+			wsServer.SetShareCallback(shareCallback)
+			if err := wsServer.Start(); err != nil {
+				util.Errorf("Failed to start WebSocket server: %v", err)
+			}
+		}
+
+		// Start Xatum server if enabled
+		if cfg.Slave.XatumEnabled {
+			xatumServer = slave.NewXatumServer(cfg, policyServer)
+			xatumServer.SetShareCallback(shareCallback)
+			if err := xatumServer.Start(); err != nil {
+				util.Errorf("Failed to start Xatum server: %v", err)
+			}
+		}
+
+		// Broadcast jobs from master to all mining servers
 		if masterCoord != nil {
 			go func() {
 				for {
@@ -164,7 +209,16 @@ func main() {
 							Timestamp:  job.Timestamp,
 							CleanJobs:  true,
 						}
+						// Broadcast to Stratum
 						stratum.BroadcastJob(stratumJob)
+						// Broadcast to WebSocket
+						if wsServer != nil {
+							wsServer.BroadcastJob(stratumJob)
+						}
+						// Broadcast to Xatum
+						if xatumServer != nil {
+							xatumServer.BroadcastJob(stratumJob)
+						}
 					}
 					// Wait for next job refresh
 					<-masterCoord.GetJobUpdateChan()
@@ -183,6 +237,12 @@ func main() {
 	util.Info("Shutting down...")
 
 	// Graceful shutdown
+	if xatumServer != nil {
+		xatumServer.Stop()
+	}
+	if wsServer != nil {
+		wsServer.Stop()
+	}
 	if stratum != nil {
 		stratum.Stop()
 	}
@@ -194,6 +254,12 @@ func main() {
 	}
 	if policyServer != nil {
 		policyServer.Stop()
+	}
+	if pprofServer != nil {
+		pprofServer.Stop()
+	}
+	if nrAgent != nil {
+		nrAgent.Stop()
 	}
 	upstreamMgr.Stop()
 

@@ -24,6 +24,8 @@ type Config struct {
 	Security   SecurityConfig   `mapstructure:"security"`
 	Notify     NotifyConfig     `mapstructure:"notify"`
 	Log        LogConfig        `mapstructure:"log"`
+	Profiling  ProfilingConfig  `mapstructure:"profiling"`
+	NewRelic   NewRelicConfig   `mapstructure:"newrelic"`
 }
 
 // PoolConfig defines pool identity settings
@@ -78,6 +80,14 @@ type SlaveConfig struct {
 	TLSKey         string `mapstructure:"tls_key"`
 	GetworkEnabled bool   `mapstructure:"getwork_enabled"`
 	GetworkBind    string `mapstructure:"getwork_bind"`
+
+	// WebSocket GetWork settings
+	WebSocketEnabled bool   `mapstructure:"websocket_enabled"`
+	WebSocketBind    string `mapstructure:"websocket_bind"`
+
+	// Xatum protocol settings (TLS-secured JSON mining protocol)
+	XatumEnabled bool   `mapstructure:"xatum_enabled"`
+	XatumBind    string `mapstructure:"xatum_bind"`
 }
 
 // MiningConfig defines mining difficulty settings
@@ -162,6 +172,19 @@ type LogConfig struct {
 	File   string `mapstructure:"file"`
 }
 
+// ProfilingConfig defines pprof profiling settings
+type ProfilingConfig struct {
+	Enabled bool   `mapstructure:"enabled"`
+	Bind    string `mapstructure:"bind"`
+}
+
+// NewRelicConfig defines New Relic APM settings
+type NewRelicConfig struct {
+	Enabled    bool   `mapstructure:"enabled"`
+	AppName    string `mapstructure:"app_name"`
+	LicenseKey string `mapstructure:"license_key"`
+}
+
 // Load reads configuration from file and environment
 func Load(configPath string) (*Config, error) {
 	v := viper.New()
@@ -230,6 +253,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("slave.stratum_tls_bind", "0.0.0.0:3334")
 	v.SetDefault("slave.getwork_enabled", false)
 	v.SetDefault("slave.getwork_bind", "0.0.0.0:8888")
+	v.SetDefault("slave.websocket_enabled", false)
+	v.SetDefault("slave.websocket_bind", "0.0.0.0:3335")
+	v.SetDefault("slave.xatum_enabled", false)
+	v.SetDefault("slave.xatum_bind", "0.0.0.0:3336")
 
 	// Mining defaults
 	v.SetDefault("mining.initial_difficulty", 1000000)
@@ -293,6 +320,15 @@ func setDefaults(v *viper.Viper) {
 	// Log defaults
 	v.SetDefault("log.level", "info")
 	v.SetDefault("log.format", "console")
+
+	// Profiling defaults (pprof)
+	v.SetDefault("profiling.enabled", false)
+	v.SetDefault("profiling.bind", "127.0.0.1:6060")
+
+	// New Relic defaults
+	v.SetDefault("newrelic.enabled", false)
+	v.SetDefault("newrelic.app_name", "TOS Pool")
+	v.SetDefault("newrelic.license_key", "")
 }
 
 // Validate checks configuration for errors
