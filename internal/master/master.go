@@ -526,29 +526,32 @@ func (m *Master) processBlocks() {
 	for _, block := range candidates {
 		confirmations := currentHeight - block.Height
 
-		// Deep orphan detection: search ±16 blocks for our hash
-		// This handles chain reorganizations better than simple height check
-		foundBlock, err := node.SearchBlockByHash(m.ctx, block.Hash, block.Height, OrphanSearchRange)
+		// TOS uses DAG structure - the PoW hash we store is different from the block ID hash
+		// returned by the daemon. We verify by checking if our miner address is the block's miner.
+		foundBlock, err := node.GetBlockByNumber(m.ctx, block.Height)
 		if err != nil {
-			util.Warnf("Error searching for block %d: %v", block.Height, err)
+			util.Warnf("Error getting block %d: %v", block.Height, err)
 			continue
 		}
 
 		if foundBlock == nil {
-			// Block not found in ±16 range - definitely orphaned
-			util.Warnf("Block %d orphaned (not found in ±%d range): %s",
-				block.Height, OrphanSearchRange, block.Hash)
+			// Block height doesn't exist yet (shouldn't happen for candidates)
+			util.Warnf("Block %d not found on chain", block.Height)
+			continue
+		}
+
+		// Check if the block at this height was mined by our finder
+		// Note: In TOS, multiple blocks can exist at same height in DAG, but only one is canonical
+		if foundBlock.Miner != block.Finder {
+			// Different miner won this height - our block is orphaned
+			util.Warnf("Block %d orphaned (miner mismatch: chain has %s, we have %s)",
+				block.Height, foundBlock.Miner[:20], block.Finder[:20])
 			m.notifier.NotifyOrphanBlock(block)
 			m.redis.RemoveOrphanBlock(block)
 			continue
 		}
 
-		// Block found - check if height changed (reorg)
-		if foundBlock.Height != block.Height {
-			util.Infof("Block %s moved from height %d to %d (reorg)",
-				block.Hash[:16], block.Height, foundBlock.Height)
-			block.Height = foundBlock.Height
-		}
+		util.Debugf("Block %d verified: miner matches %s", block.Height, block.Finder[:20])
 
 		// Update reward from node (base reward)
 		block.Reward = foundBlock.Reward
