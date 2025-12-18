@@ -113,8 +113,9 @@ type Session struct {
 
 // VardiffStats tracks share submission rate for difficulty adjustment
 type VardiffStats struct {
-	LastRetarget time.Time
-	SharesSince  int
+	LastRetarget   time.Time
+	SharesSince    int
+	MinerRequested bool // True if miner specified their own difficulty
 }
 
 // StratumRequest is a JSON-RPC request from miner
@@ -376,9 +377,68 @@ func (s *StratumServer) handleRequest(session *Session, req *StratumRequest) {
 		s.handleSubmit(session, req)
 	case "mining.extranonce.subscribe":
 		s.sendResult(session, req.ID, true)
+	case "mining.ping":
+		s.handlePing(session, req)
+	case "mining.set_difficulty":
+		s.handleSetDifficulty(session, req)
 	default:
 		s.sendError(session, req.ID, -32601, "Method not found")
 	}
+}
+
+// handlePing responds to mining.ping keepalive
+func (s *StratumServer) handlePing(session *Session, req *StratumRequest) {
+	// Update last activity
+	session.mu.Lock()
+	session.LastShare = time.Now()
+	session.mu.Unlock()
+
+	// Respond with pong
+	s.sendResult(session, req.ID, "pong")
+}
+
+// handleSetDifficulty allows miner to request specific difficulty
+func (s *StratumServer) handleSetDifficulty(session *Session, req *StratumRequest) {
+	if len(req.Params) < 1 {
+		s.sendError(session, req.ID, -1, "Invalid params")
+		return
+	}
+
+	// Parse requested difficulty
+	var requestedDiff uint64
+	switch v := req.Params[0].(type) {
+	case float64:
+		requestedDiff = uint64(v)
+	case int:
+		requestedDiff = uint64(v)
+	case string:
+		fmt.Sscanf(v, "%d", &requestedDiff)
+	default:
+		s.sendError(session, req.ID, -1, "Invalid difficulty format")
+		return
+	}
+
+	// Validate difficulty bounds
+	if requestedDiff < s.cfg.Mining.MinDifficulty {
+		requestedDiff = s.cfg.Mining.MinDifficulty
+	}
+	if requestedDiff > s.cfg.Mining.MaxDifficulty {
+		requestedDiff = s.cfg.Mining.MaxDifficulty
+	}
+
+	// Set the difficulty
+	session.mu.Lock()
+	session.Difficulty = requestedDiff
+	session.VardiffStats.MinerRequested = true // Disable auto-vardiff
+	session.mu.Unlock()
+
+	// Confirm to miner
+	s.sendResult(session, req.ID, true)
+
+	// Send new difficulty notification
+	s.sendDifficulty(session, requestedDiff)
+
+	util.Debugf("Session %d: miner requested difficulty %d", session.ID, requestedDiff)
 }
 
 // handleSubscribe processes mining.subscribe

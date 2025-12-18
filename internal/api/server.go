@@ -2,7 +2,10 @@
 package api
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,6 +14,21 @@ import (
 	"github.com/tos-network/tos-pool/internal/storage"
 	"github.com/tos-network/tos-pool/internal/util"
 )
+
+// UpstreamStateFunc is a callback to get upstream states
+type UpstreamStateFunc func() []UpstreamStatus
+
+// UpstreamStatus represents the status of an upstream node
+type UpstreamStatus struct {
+	Name         string  `json:"name"`
+	URL          string  `json:"url"`
+	Healthy      bool    `json:"healthy"`
+	ResponseTime float64 `json:"response_time_ms"`
+	Height       uint64  `json:"height"`
+	Weight       int     `json:"weight"`
+	FailCount    int32   `json:"fail_count"`
+	SuccessCount int32   `json:"success_count"`
+}
 
 // Server is the API server
 type Server struct {
@@ -23,6 +41,9 @@ type Server struct {
 	statsCacheMu   sync.RWMutex
 	statsCache     *StatsResponse
 	statsCacheTime time.Time
+
+	// Upstream state callback
+	upstreamStateFunc UpstreamStateFunc
 }
 
 // StatsResponse is the /api/stats response
@@ -106,8 +127,8 @@ func (s *Server) setupRoutes() {
 	// CORS middleware
 	s.router.Use(func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Methods", "GET, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
@@ -124,6 +145,27 @@ func (s *Server) setupRoutes() {
 		api.GET("/payments", s.handlePayments)
 		api.GET("/miners/:address", s.handleMiner)
 		api.GET("/miners/:address/payments", s.handleMinerPayments)
+		api.GET("/miners/:address/chart", s.handleMinerChart)
+		api.GET("/luck", s.handleLuck)
+		api.GET("/chart/hashrate", s.handlePoolHashrateChart)
+	}
+
+	// Admin API (password protected)
+	if s.cfg.API.AdminEnabled && s.cfg.API.AdminPassword != "" {
+		admin := s.router.Group("/admin")
+		admin.Use(s.adminAuthMiddleware())
+		{
+			admin.GET("/stats", s.handleAdminStats)
+			admin.GET("/blacklist", s.handleGetBlacklist)
+			admin.POST("/blacklist", s.handleAddBlacklist)
+			admin.DELETE("/blacklist/:address", s.handleRemoveBlacklist)
+			admin.GET("/whitelist", s.handleGetWhitelist)
+			admin.POST("/whitelist", s.handleAddWhitelist)
+			admin.DELETE("/whitelist/:ip", s.handleRemoveWhitelist)
+			admin.GET("/pending-payments", s.handlePendingPayments)
+			admin.GET("/backup", s.handleBackup)
+			admin.GET("/upstreams", s.handleUpstreams)
+		}
 	}
 
 	// Health check
@@ -156,6 +198,11 @@ func (s *Server) Stop() error {
 		return s.server.Close()
 	}
 	return nil
+}
+
+// SetUpstreamStateFunc sets the callback for getting upstream states
+func (s *Server) SetUpstreamStateFunc(fn UpstreamStateFunc) {
+	s.upstreamStateFunc = fn
 }
 
 // handleStats returns pool and network statistics
@@ -324,4 +371,329 @@ func (s *Server) handleMinerPayments(c *gin.Context) {
 	}
 
 	c.JSON(200, gin.H{"payments": payments})
+}
+
+// LuckResponse represents luck statistics
+type LuckResponse struct {
+	Luck24h   float64      `json:"luck_24h"`
+	Luck7d    float64      `json:"luck_7d"`
+	Luck30d   float64      `json:"luck_30d"`
+	LuckAll   float64      `json:"luck_all"`
+	Blocks    []BlockLuck  `json:"recent_blocks"`
+}
+
+// BlockLuck represents luck info for a single block
+type BlockLuck struct {
+	Height      uint64  `json:"height"`
+	Effort      float64 `json:"effort"`
+	RoundShares uint64  `json:"round_shares"`
+	Difficulty  uint64  `json:"difficulty"`
+	Timestamp   int64   `json:"timestamp"`
+}
+
+// handleLuck returns mining luck statistics
+func (s *Server) handleLuck(c *gin.Context) {
+	luck, err := s.redis.GetLuckStats()
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to get luck stats"})
+		return
+	}
+
+	c.JSON(200, luck)
+}
+
+// adminAuthMiddleware validates admin password
+func (s *Server) adminAuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Check Authorization header
+		auth := c.GetHeader("Authorization")
+		if auth == "" {
+			c.JSON(401, gin.H{"error": "Authorization required"})
+			c.Abort()
+			return
+		}
+
+		// Support both "Bearer <password>" and plain password
+		password := strings.TrimPrefix(auth, "Bearer ")
+		if password != s.cfg.API.AdminPassword {
+			c.JSON(403, gin.H{"error": "Invalid password"})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// AdminStatsResponse contains detailed admin statistics
+type AdminStatsResponse struct {
+	Pool           *storage.PoolStats    `json:"pool"`
+	Network        *storage.NetworkStats `json:"network"`
+	PendingPayouts int                   `json:"pending_payouts"`
+	LockedPayouts  bool                  `json:"locked_payouts"`
+	BlacklistCount int                   `json:"blacklist_count"`
+	WhitelistCount int                   `json:"whitelist_count"`
+	RedisInfo      map[string]string     `json:"redis_info"`
+}
+
+// handleAdminStats returns detailed admin statistics
+func (s *Server) handleAdminStats(c *gin.Context) {
+	poolStats, _ := s.redis.GetPoolStats(
+		s.cfg.Validation.HashrateWindow,
+		s.cfg.Validation.HashrateLargeWindow,
+	)
+	netStats, _ := s.redis.GetNetworkStats()
+	pendingPayments, _ := s.redis.GetPendingPayments()
+	locked, _ := s.redis.IsPayoutsLocked()
+	blacklist, _ := s.redis.GetBlacklist()
+	whitelist, _ := s.redis.GetWhitelist()
+
+	response := AdminStatsResponse{
+		Pool:           poolStats,
+		Network:        netStats,
+		PendingPayouts: len(pendingPayments),
+		LockedPayouts:  locked,
+		BlacklistCount: len(blacklist),
+		WhitelistCount: len(whitelist),
+	}
+
+	c.JSON(200, response)
+}
+
+// handleGetBlacklist returns all blacklisted addresses
+func (s *Server) handleGetBlacklist(c *gin.Context) {
+	blacklist, err := s.redis.GetBlacklist()
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to get blacklist"})
+		return
+	}
+
+	c.JSON(200, gin.H{"blacklist": blacklist})
+}
+
+// BlacklistRequest represents a blacklist add request
+type BlacklistRequest struct {
+	Address string `json:"address"`
+}
+
+// handleAddBlacklist adds an address to the blacklist
+func (s *Server) handleAddBlacklist(c *gin.Context) {
+	var req BlacklistRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	if req.Address == "" {
+		c.JSON(400, gin.H{"error": "Address required"})
+		return
+	}
+
+	if err := s.redis.AddToBlacklist(req.Address); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to add to blacklist"})
+		return
+	}
+
+	util.Infof("Admin: Added %s to blacklist", req.Address)
+	c.JSON(200, gin.H{"status": "ok", "address": req.Address})
+}
+
+// handleRemoveBlacklist removes an address from the blacklist
+func (s *Server) handleRemoveBlacklist(c *gin.Context) {
+	address := c.Param("address")
+	if address == "" {
+		c.JSON(400, gin.H{"error": "Address required"})
+		return
+	}
+
+	if err := s.redis.RemoveFromBlacklist(address); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to remove from blacklist"})
+		return
+	}
+
+	util.Infof("Admin: Removed %s from blacklist", address)
+	c.JSON(200, gin.H{"status": "ok", "address": address})
+}
+
+// handleGetWhitelist returns all whitelisted IPs
+func (s *Server) handleGetWhitelist(c *gin.Context) {
+	whitelist, err := s.redis.GetWhitelist()
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to get whitelist"})
+		return
+	}
+
+	c.JSON(200, gin.H{"whitelist": whitelist})
+}
+
+// WhitelistRequest represents a whitelist add request
+type WhitelistRequest struct {
+	IP string `json:"ip"`
+}
+
+// handleAddWhitelist adds an IP to the whitelist
+func (s *Server) handleAddWhitelist(c *gin.Context) {
+	var req WhitelistRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	if req.IP == "" {
+		c.JSON(400, gin.H{"error": "IP required"})
+		return
+	}
+
+	if err := s.redis.AddToWhitelist(req.IP); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to add to whitelist"})
+		return
+	}
+
+	util.Infof("Admin: Added %s to whitelist", req.IP)
+	c.JSON(200, gin.H{"status": "ok", "ip": req.IP})
+}
+
+// handleRemoveWhitelist removes an IP from the whitelist
+func (s *Server) handleRemoveWhitelist(c *gin.Context) {
+	ip := c.Param("ip")
+	if ip == "" {
+		c.JSON(400, gin.H{"error": "IP required"})
+		return
+	}
+
+	if err := s.redis.RemoveFromWhitelist(ip); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to remove from whitelist"})
+		return
+	}
+
+	util.Infof("Admin: Removed %s from whitelist", ip)
+	c.JSON(200, gin.H{"status": "ok", "ip": ip})
+}
+
+// handlePendingPayments returns pending payments
+func (s *Server) handlePendingPayments(c *gin.Context) {
+	payments, err := s.redis.GetPendingPayments()
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to get pending payments"})
+		return
+	}
+
+	c.JSON(200, gin.H{"pending_payments": payments})
+}
+
+// handleBackup returns a JSON backup of pool data
+func (s *Server) handleBackup(c *gin.Context) {
+	backup, err := s.redis.CreateBackup()
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to create backup"})
+		return
+	}
+
+	// Set headers for file download
+	c.Header("Content-Disposition", "attachment; filename=tos-pool-backup.json")
+	c.Header("Content-Type", "application/json")
+
+	data, _ := json.MarshalIndent(backup, "", "  ")
+	c.Data(200, "application/json", data)
+}
+
+// handlePoolHashrateChart returns pool hashrate history
+func (s *Server) handlePoolHashrateChart(c *gin.Context) {
+	hoursStr := c.DefaultQuery("hours", "24")
+	hours := 24
+	if h, err := parseHours(hoursStr); err == nil {
+		hours = h
+	}
+
+	// Limit to 168 hours (7 days)
+	if hours > 168 {
+		hours = 168
+	}
+
+	history, err := s.redis.GetPoolHashrateHistory(hours)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to get hashrate history"})
+		return
+	}
+
+	c.JSON(200, gin.H{
+		"hours":  hours,
+		"points": history,
+	})
+}
+
+// handleMinerChart returns miner hashrate history
+func (s *Server) handleMinerChart(c *gin.Context) {
+	address := c.Param("address")
+
+	if !util.ValidateAddress(address) {
+		c.JSON(400, gin.H{"error": "Invalid address"})
+		return
+	}
+
+	hoursStr := c.DefaultQuery("hours", "24")
+	hours := 24
+	if h, err := parseHours(hoursStr); err == nil {
+		hours = h
+	}
+
+	// Limit to 24 hours for miner charts
+	if hours > 24 {
+		hours = 24
+	}
+
+	history, err := s.redis.GetMinerHashrateHistory(address, hours)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to get hashrate history"})
+		return
+	}
+
+	c.JSON(200, gin.H{
+		"address": address,
+		"hours":   hours,
+		"points":  history,
+	})
+}
+
+// parseHours parses hours string to int
+func parseHours(s string) (int, error) {
+	var hours int
+	_, err := fmt.Sscanf(s, "%d", &hours)
+	if err != nil || hours < 1 {
+		return 24, err
+	}
+	return hours, nil
+}
+
+// handleUpstreams returns upstream node status
+func (s *Server) handleUpstreams(c *gin.Context) {
+	if s.upstreamStateFunc == nil {
+		c.JSON(200, gin.H{
+			"upstreams":     []UpstreamStatus{},
+			"total":         0,
+			"healthy":       0,
+			"active":        "",
+		})
+		return
+	}
+
+	upstreams := s.upstreamStateFunc()
+
+	healthyCount := 0
+	var activeUpstream string
+	for _, u := range upstreams {
+		if u.Healthy {
+			healthyCount++
+			if activeUpstream == "" {
+				activeUpstream = u.Name
+			}
+		}
+	}
+
+	c.JSON(200, gin.H{
+		"upstreams": upstreams,
+		"total":     len(upstreams),
+		"healthy":   healthyCount,
+		"active":    activeUpstream,
+	})
 }

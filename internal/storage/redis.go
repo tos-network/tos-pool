@@ -851,3 +851,408 @@ func (r *RedisClient) GetMinerPayments(address string, limit int64) ([]*Payment,
 
 	return payments, nil
 }
+
+// LuckStats represents mining luck statistics
+type LuckStats struct {
+	Luck24h  float64      `json:"luck_24h"`
+	Luck7d   float64      `json:"luck_7d"`
+	Luck30d  float64      `json:"luck_30d"`
+	LuckAll  float64      `json:"luck_all"`
+	Blocks   []BlockLuck  `json:"recent_blocks"`
+}
+
+// BlockLuck represents luck info for a single block
+type BlockLuck struct {
+	Height      uint64  `json:"height"`
+	Effort      float64 `json:"effort"`
+	RoundShares uint64  `json:"round_shares"`
+	Difficulty  uint64  `json:"difficulty"`
+	Timestamp   int64   `json:"timestamp"`
+}
+
+// GetLuckStats calculates mining luck over various time windows
+func (r *RedisClient) GetLuckStats() (*LuckStats, error) {
+	now := time.Now().Unix()
+	day := int64(24 * 60 * 60)
+
+	// Get all matured blocks
+	blocks, err := r.GetRecentBlocks(1000)
+	if err != nil {
+		return nil, err
+	}
+
+	stats := &LuckStats{
+		Blocks: make([]BlockLuck, 0),
+	}
+
+	var shares24h, diff24h uint64
+	var shares7d, diff7d uint64
+	var shares30d, diff30d uint64
+	var sharesAll, diffAll uint64
+
+	for i, block := range blocks {
+		// Calculate effort for this block
+		var effort float64
+		if block.Difficulty > 0 {
+			effort = (float64(block.RoundShares) / float64(block.Difficulty)) * 100
+		}
+
+		// Add to recent blocks (max 50)
+		if i < 50 {
+			stats.Blocks = append(stats.Blocks, BlockLuck{
+				Height:      block.Height,
+				Effort:      effort,
+				RoundShares: block.RoundShares,
+				Difficulty:  block.Difficulty,
+				Timestamp:   block.Timestamp,
+			})
+		}
+
+		// Aggregate by time window
+		age := now - block.Timestamp
+
+		if age <= day {
+			shares24h += block.RoundShares
+			diff24h += block.Difficulty
+		}
+		if age <= 7*day {
+			shares7d += block.RoundShares
+			diff7d += block.Difficulty
+		}
+		if age <= 30*day {
+			shares30d += block.RoundShares
+			diff30d += block.Difficulty
+		}
+		sharesAll += block.RoundShares
+		diffAll += block.Difficulty
+	}
+
+	// Calculate luck percentages (100% = expected, <100% = lucky, >100% = unlucky)
+	if diff24h > 0 {
+		stats.Luck24h = (float64(shares24h) / float64(diff24h)) * 100
+	}
+	if diff7d > 0 {
+		stats.Luck7d = (float64(shares7d) / float64(diff7d)) * 100
+	}
+	if diff30d > 0 {
+		stats.Luck30d = (float64(shares30d) / float64(diff30d)) * 100
+	}
+	if diffAll > 0 {
+		stats.LuckAll = (float64(sharesAll) / float64(diffAll)) * 100
+	}
+
+	return stats, nil
+}
+
+// PoolBackup represents a full pool data backup
+type PoolBackup struct {
+	Timestamp       int64                  `json:"timestamp"`
+	Version         string                 `json:"version"`
+	Stats           *PoolStats             `json:"stats"`
+	NetworkStats    *NetworkStats          `json:"network_stats"`
+	Miners          map[string]*Miner      `json:"miners"`
+	CandidateBlocks []*Block               `json:"candidate_blocks"`
+	ImmatureBlocks  []*Block               `json:"immature_blocks"`
+	MaturedBlocks   []*Block               `json:"matured_blocks"`
+	PendingPayments []*Payment             `json:"pending_payments"`
+	RecentPayments  []*Payment             `json:"recent_payments"`
+	Blacklist       []string               `json:"blacklist"`
+	Whitelist       []string               `json:"whitelist"`
+}
+
+// CreateBackup creates a JSON backup of all pool data
+func (r *RedisClient) CreateBackup() (*PoolBackup, error) {
+	backup := &PoolBackup{
+		Timestamp: time.Now().Unix(),
+		Version:   "1.0",
+		Miners:    make(map[string]*Miner),
+	}
+
+	// Get stats
+	backup.Stats, _ = r.GetPoolStats(10*time.Minute, 3*time.Hour)
+	backup.NetworkStats, _ = r.GetNetworkStats()
+
+	// Get blocks
+	backup.CandidateBlocks, _ = r.GetCandidateBlocks()
+	backup.ImmatureBlocks, _ = r.getBlocksByKey(keyBlocksImmature)
+	backup.MaturedBlocks, _ = r.getBlocksByKey(keyBlocksMatured)
+
+	// Get payments
+	backup.PendingPayments, _ = r.GetPendingPayments()
+	backup.RecentPayments, _ = r.GetRecentPayments(500)
+
+	// Get lists
+	backup.Blacklist, _ = r.GetBlacklist()
+	backup.Whitelist, _ = r.GetWhitelist()
+
+	// Get all miners
+	var cursor uint64
+	for {
+		keys, newCursor, err := r.client.Scan(r.ctx, cursor, keyPrefix+"miners:*", 1000).Result()
+		if err != nil {
+			break
+		}
+
+		for _, key := range keys {
+			if strings.Contains(key, ":workers") {
+				continue
+			}
+			address := strings.TrimPrefix(key, keyPrefix+"miners:")
+			miner, err := r.GetMiner(address)
+			if err == nil && miner != nil {
+				backup.Miners[address] = miner
+			}
+		}
+
+		cursor = newCursor
+		if cursor == 0 {
+			break
+		}
+	}
+
+	return backup, nil
+}
+
+// getBlocksByKey retrieves blocks from a specific sorted set
+func (r *RedisClient) getBlocksByKey(key string) ([]*Block, error) {
+	results, err := r.client.ZRange(r.ctx, key, 0, -1).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	blocks := make([]*Block, 0, len(results))
+	for _, result := range results {
+		var block Block
+		if err := json.Unmarshal([]byte(result), &block); err == nil {
+			blocks = append(blocks, &block)
+		}
+	}
+	return blocks, nil
+}
+
+// Debt tracking
+
+const keyDebt = keyPrefix + "debt:%s"
+const keyDebtTotal = keyPrefix + "debt:total"
+
+// DebtRecord represents a debt entry for a miner
+type DebtRecord struct {
+	Address   string `json:"address"`
+	Amount    int64  `json:"amount"` // Positive = pool owes miner, Negative = miner owes pool
+	Reason    string `json:"reason"`
+	Timestamp int64  `json:"timestamp"`
+}
+
+// AddDebt records a debt (positive = pool owes miner)
+func (r *RedisClient) AddDebt(address string, amount int64, reason string) error {
+	pipe := r.client.Pipeline()
+
+	// Update miner's debt balance
+	debtKey := fmt.Sprintf(keyDebt, address)
+	pipe.IncrBy(r.ctx, debtKey, amount)
+
+	// Update total debt
+	pipe.IncrBy(r.ctx, keyDebtTotal, amount)
+
+	// Store debt record for audit
+	record := DebtRecord{
+		Address:   address,
+		Amount:    amount,
+		Reason:    reason,
+		Timestamp: time.Now().Unix(),
+	}
+	recordJSON, _ := json.Marshal(record)
+	debtHistoryKey := keyPrefix + "debt:history:" + address
+	pipe.LPush(r.ctx, debtHistoryKey, string(recordJSON))
+	pipe.LTrim(r.ctx, debtHistoryKey, 0, 99) // Keep last 100 records
+
+	_, err := pipe.Exec(r.ctx)
+	return err
+}
+
+// GetDebt returns the current debt for a miner
+func (r *RedisClient) GetDebt(address string) (int64, error) {
+	debtKey := fmt.Sprintf(keyDebt, address)
+	return r.client.Get(r.ctx, debtKey).Int64()
+}
+
+// GetTotalDebt returns the total pool debt
+func (r *RedisClient) GetTotalDebt() (int64, error) {
+	return r.client.Get(r.ctx, keyDebtTotal).Int64()
+}
+
+// GetDebtHistory returns debt history for a miner
+func (r *RedisClient) GetDebtHistory(address string, limit int64) ([]DebtRecord, error) {
+	debtHistoryKey := keyPrefix + "debt:history:" + address
+	results, err := r.client.LRange(r.ctx, debtHistoryKey, 0, limit-1).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	records := make([]DebtRecord, 0, len(results))
+	for _, result := range results {
+		var record DebtRecord
+		if err := json.Unmarshal([]byte(result), &record); err == nil {
+			records = append(records, record)
+		}
+	}
+	return records, nil
+}
+
+// SettleDebt settles a miner's debt by adjusting their balance
+func (r *RedisClient) SettleDebt(address string) error {
+	debt, err := r.GetDebt(address)
+	if err != nil || debt == 0 {
+		return err
+	}
+
+	minerKey := fmt.Sprintf(keyMiner, address)
+	debtKey := fmt.Sprintf(keyDebt, address)
+
+	pipe := r.client.Pipeline()
+
+	if debt > 0 {
+		// Pool owes miner: add to balance
+		pipe.HIncrBy(r.ctx, minerKey, "balance", debt)
+	} else {
+		// Miner owes pool: deduct from balance (ensure non-negative)
+		pipe.HIncrBy(r.ctx, minerKey, "balance", debt) // debt is already negative
+	}
+
+	// Clear debt
+	pipe.Del(r.ctx, debtKey)
+	pipe.IncrBy(r.ctx, keyDebtTotal, -debt)
+
+	// Record settlement
+	record := DebtRecord{
+		Address:   address,
+		Amount:    -debt, // Inverse of settled amount
+		Reason:    "settlement",
+		Timestamp: time.Now().Unix(),
+	}
+	recordJSON, _ := json.Marshal(record)
+	debtHistoryKey := keyPrefix + "debt:history:" + address
+	pipe.LPush(r.ctx, debtHistoryKey, string(recordJSON))
+
+	_, err = pipe.Exec(r.ctx)
+	return err
+}
+
+// Hashrate history keys
+const (
+	keyHashratePool   = keyPrefix + "hashrate:pool"
+	keyHashrateMiner  = keyPrefix + "hashrate:miner:%s"
+	keyHashrateWorker = keyPrefix + "hashrate:worker:%s:%s"
+)
+
+// HashratePoint represents a single hashrate data point
+type HashratePoint struct {
+	Timestamp int64   `json:"t"`
+	Hashrate  float64 `json:"h"`
+}
+
+// StorePoolHashrate stores a pool hashrate sample
+func (r *RedisClient) StorePoolHashrate(hashrate float64) error {
+	point := HashratePoint{
+		Timestamp: time.Now().Unix(),
+		Hashrate:  hashrate,
+	}
+	data, _ := json.Marshal(point)
+
+	pipe := r.client.Pipeline()
+	pipe.ZAdd(r.ctx, keyHashratePool, &redis.Z{
+		Score:  float64(point.Timestamp),
+		Member: string(data),
+	})
+	// Keep last 7 days of data (604800 seconds)
+	cutoff := time.Now().Unix() - 604800
+	pipe.ZRemRangeByScore(r.ctx, keyHashratePool, "0", fmt.Sprintf("%d", cutoff))
+
+	_, err := pipe.Exec(r.ctx)
+	return err
+}
+
+// StoreMinerHashrate stores a miner hashrate sample
+func (r *RedisClient) StoreMinerHashrate(address string, hashrate float64) error {
+	point := HashratePoint{
+		Timestamp: time.Now().Unix(),
+		Hashrate:  hashrate,
+	}
+	data, _ := json.Marshal(point)
+
+	key := fmt.Sprintf(keyHashrateMiner, address)
+	pipe := r.client.Pipeline()
+	pipe.ZAdd(r.ctx, key, &redis.Z{
+		Score:  float64(point.Timestamp),
+		Member: string(data),
+	})
+	// Keep last 24 hours of data
+	cutoff := time.Now().Unix() - 86400
+	pipe.ZRemRangeByScore(r.ctx, key, "0", fmt.Sprintf("%d", cutoff))
+
+	_, err := pipe.Exec(r.ctx)
+	return err
+}
+
+// StoreWorkerHashrate stores a worker hashrate sample
+func (r *RedisClient) StoreWorkerHashrate(address, worker string, hashrate float64) error {
+	point := HashratePoint{
+		Timestamp: time.Now().Unix(),
+		Hashrate:  hashrate,
+	}
+	data, _ := json.Marshal(point)
+
+	key := fmt.Sprintf(keyHashrateWorker, address, worker)
+	pipe := r.client.Pipeline()
+	pipe.ZAdd(r.ctx, key, &redis.Z{
+		Score:  float64(point.Timestamp),
+		Member: string(data),
+	})
+	// Keep last 24 hours
+	cutoff := time.Now().Unix() - 86400
+	pipe.ZRemRangeByScore(r.ctx, key, "0", fmt.Sprintf("%d", cutoff))
+
+	_, err := pipe.Exec(r.ctx)
+	return err
+}
+
+// GetPoolHashrateHistory returns pool hashrate history
+func (r *RedisClient) GetPoolHashrateHistory(hours int) ([]HashratePoint, error) {
+	cutoff := time.Now().Unix() - int64(hours*3600)
+	return r.getHashrateHistory(keyHashratePool, cutoff)
+}
+
+// GetMinerHashrateHistory returns miner hashrate history
+func (r *RedisClient) GetMinerHashrateHistory(address string, hours int) ([]HashratePoint, error) {
+	key := fmt.Sprintf(keyHashrateMiner, address)
+	cutoff := time.Now().Unix() - int64(hours*3600)
+	return r.getHashrateHistory(key, cutoff)
+}
+
+// GetWorkerHashrateHistory returns worker hashrate history
+func (r *RedisClient) GetWorkerHashrateHistory(address, worker string, hours int) ([]HashratePoint, error) {
+	key := fmt.Sprintf(keyHashrateWorker, address, worker)
+	cutoff := time.Now().Unix() - int64(hours*3600)
+	return r.getHashrateHistory(key, cutoff)
+}
+
+// getHashrateHistory retrieves hashrate history from a sorted set
+func (r *RedisClient) getHashrateHistory(key string, since int64) ([]HashratePoint, error) {
+	results, err := r.client.ZRangeByScore(r.ctx, key, &redis.ZRangeBy{
+		Min: fmt.Sprintf("%d", since),
+		Max: "+inf",
+	}).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	points := make([]HashratePoint, 0, len(results))
+	for _, result := range results {
+		var point HashratePoint
+		if err := json.Unmarshal([]byte(result), &point); err == nil {
+			points = append(points, point)
+		}
+	}
+
+	return points, nil
+}

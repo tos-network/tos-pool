@@ -95,6 +95,7 @@ type BlockInfo struct {
 	GasUsed      uint64 `json:"gasUsed"`
 	GasLimit     uint64 `json:"gasLimit"`
 	Transactions int    `json:"transactionCount"`
+	TxFees       uint64 `json:"txFees"` // Total transaction fees in block
 }
 
 // NetworkInfo represents network statistics
@@ -514,4 +515,83 @@ func (c *TOSClient) GetGasPrice(ctx context.Context) (uint64, error) {
 	var gasPrice uint64
 	fmt.Sscanf(gasPriceHex, "0x%x", &gasPrice)
 	return gasPrice, nil
+}
+
+// GetBlockTxFees calculates total transaction fees for a block
+func (c *TOSClient) GetBlockTxFees(ctx context.Context, blockNumber uint64) (uint64, error) {
+	// Get block with full transactions
+	result, err := c.call(ctx, "tos_getBlockByNumber", fmt.Sprintf("0x%x", blockNumber), true)
+	if err != nil {
+		return 0, err
+	}
+
+	if string(result) == "null" {
+		return 0, nil
+	}
+
+	// Parse block with transactions
+	var blockData struct {
+		Transactions []struct {
+			Hash     string `json:"hash"`
+			GasPrice string `json:"gasPrice"`
+		} `json:"transactions"`
+	}
+	if err := json.Unmarshal(result, &blockData); err != nil {
+		return 0, err
+	}
+
+	var totalFees uint64
+	for _, tx := range blockData.Transactions {
+		// Get receipt for actual gas used
+		receipt, err := c.GetTransactionReceipt(ctx, tx.Hash)
+		if err != nil || receipt == nil {
+			continue
+		}
+
+		var gasPrice uint64
+		fmt.Sscanf(tx.GasPrice, "0x%x", &gasPrice)
+
+		totalFees += receipt.GasUsed * gasPrice
+	}
+
+	return totalFees, nil
+}
+
+// SearchBlockByHash searches for a block hash in a range of heights
+// Used for deep orphan detection - searches ±searchRange blocks
+func (c *TOSClient) SearchBlockByHash(ctx context.Context, targetHash string, centerHeight uint64, searchRange int) (*BlockInfo, error) {
+	// Search from center outward
+	for offset := 0; offset <= searchRange; offset++ {
+		// Check center + offset
+		if offset >= 0 {
+			height := centerHeight + uint64(offset)
+			block, err := c.GetBlockByNumber(ctx, height)
+			if err == nil && block != nil && block.Hash == targetHash {
+				return block, nil
+			}
+		}
+
+		// Check center - offset (skip 0 to avoid duplicate)
+		if offset > 0 && centerHeight >= uint64(offset) {
+			height := centerHeight - uint64(offset)
+			block, err := c.GetBlockByNumber(ctx, height)
+			if err == nil && block != nil && block.Hash == targetHash {
+				return block, nil
+			}
+		}
+	}
+
+	return nil, nil
+}
+
+// GetBlockRewardWithFees returns block reward including transaction fees
+func (c *TOSClient) GetBlockRewardWithFees(ctx context.Context, blockNumber uint64) (uint64, uint64, error) {
+	block, err := c.GetBlockByNumber(ctx, blockNumber)
+	if err != nil || block == nil {
+		return 0, 0, err
+	}
+
+	txFees, _ := c.GetBlockTxFees(ctx, blockNumber)
+
+	return block.Reward, txFees, nil
 }

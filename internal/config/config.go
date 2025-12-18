@@ -22,6 +22,7 @@ type Config struct {
 	Payouts    PayoutsConfig    `mapstructure:"payouts"`
 	API        APIConfig        `mapstructure:"api"`
 	Security   SecurityConfig   `mapstructure:"security"`
+	Notify     NotifyConfig     `mapstructure:"notify"`
 	Log        LogConfig        `mapstructure:"log"`
 }
 
@@ -34,8 +35,23 @@ type PoolConfig struct {
 
 // NodeConfig defines TOS node connection settings
 type NodeConfig struct {
-	URL     string        `mapstructure:"url"`
+	URL     string        `mapstructure:"url"`      // Primary node URL (for backward compatibility)
 	Timeout time.Duration `mapstructure:"timeout"`
+
+	// Multi-upstream failover settings
+	Upstreams           []UpstreamConfig `mapstructure:"upstreams"`            // Multiple upstream nodes
+	HealthCheckInterval time.Duration    `mapstructure:"health_check_interval"` // Health check interval (default 5s)
+	HealthCheckTimeout  time.Duration    `mapstructure:"health_check_timeout"`  // Health check timeout (default 3s)
+	MaxFailures         int              `mapstructure:"max_failures"`          // Failures before marking unhealthy (default 3)
+	RecoveryThreshold   int              `mapstructure:"recovery_threshold"`    // Successes before marking healthy (default 2)
+}
+
+// UpstreamConfig defines settings for a single upstream node
+type UpstreamConfig struct {
+	Name    string        `mapstructure:"name"`    // Friendly name for logging
+	URL     string        `mapstructure:"url"`     // Node RPC URL
+	Timeout time.Duration `mapstructure:"timeout"` // Per-upstream timeout (optional, uses global if not set)
+	Weight  int           `mapstructure:"weight"`  // Priority weight (higher = preferred, default 1)
 }
 
 // RedisConfig defines Redis connection settings
@@ -60,6 +76,8 @@ type SlaveConfig struct {
 	StratumTLSBind string `mapstructure:"stratum_tls_bind"`
 	TLSCert        string `mapstructure:"tls_cert"`
 	TLSKey         string `mapstructure:"tls_key"`
+	GetworkEnabled bool   `mapstructure:"getwork_enabled"`
+	GetworkBind    string `mapstructure:"getwork_bind"`
 }
 
 // MiningConfig defines mining difficulty settings
@@ -91,7 +109,19 @@ type UnlockerConfig struct {
 
 // PPLNSConfig defines PPLNS payment settings
 type PPLNSConfig struct {
-	Window float64 `mapstructure:"window"`
+	Window        float64 `mapstructure:"window"`
+	DynamicWindow bool    `mapstructure:"dynamic_window"`
+	MinWindow     float64 `mapstructure:"min_window"`
+	MaxWindow     float64 `mapstructure:"max_window"`
+}
+
+// NotifyConfig defines notification settings
+type NotifyConfig struct {
+	Enabled      bool   `mapstructure:"enabled"`
+	DiscordURL   string `mapstructure:"discord_url"`
+	TelegramBot  string `mapstructure:"telegram_bot"`
+	TelegramChat string `mapstructure:"telegram_chat"`
+	PoolURL      string `mapstructure:"pool_url"`
 }
 
 // PayoutsConfig defines payment processing settings
@@ -102,14 +132,18 @@ type PayoutsConfig struct {
 	MaxAddressesPerTx int           `mapstructure:"max_addresses_per_tx"`
 	GasLimit          uint64        `mapstructure:"gas_limit"`
 	GasPrice          string        `mapstructure:"gas_price"`
+	WithdrawalFee     uint64        `mapstructure:"withdrawal_fee"`      // Fixed fee per withdrawal (in smallest unit)
+	WithdrawalFeeRate float64       `mapstructure:"withdrawal_fee_rate"` // Percentage fee (0.01 = 1%)
 }
 
 // APIConfig defines API server settings
 type APIConfig struct {
-	Enabled     bool          `mapstructure:"enabled"`
-	Bind        string        `mapstructure:"bind"`
-	StatsCache  time.Duration `mapstructure:"stats_cache"`
-	CORSOrigins []string      `mapstructure:"cors_origins"`
+	Enabled       bool          `mapstructure:"enabled"`
+	Bind          string        `mapstructure:"bind"`
+	StatsCache    time.Duration `mapstructure:"stats_cache"`
+	CORSOrigins   []string      `mapstructure:"cors_origins"`
+	AdminEnabled  bool          `mapstructure:"admin_enabled"`
+	AdminPassword string        `mapstructure:"admin_password"`
 }
 
 // SecurityConfig defines security settings
@@ -177,6 +211,10 @@ func setDefaults(v *viper.Viper) {
 	// Node defaults
 	v.SetDefault("node.url", "http://127.0.0.1:8545")
 	v.SetDefault("node.timeout", "10s")
+	v.SetDefault("node.health_check_interval", "5s")
+	v.SetDefault("node.health_check_timeout", "3s")
+	v.SetDefault("node.max_failures", 3)
+	v.SetDefault("node.recovery_threshold", 2)
 
 	// Redis defaults
 	v.SetDefault("redis.url", "127.0.0.1:6379")
@@ -190,6 +228,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("slave.enabled", true)
 	v.SetDefault("slave.stratum_bind", "0.0.0.0:3333")
 	v.SetDefault("slave.stratum_tls_bind", "0.0.0.0:3334")
+	v.SetDefault("slave.getwork_enabled", false)
+	v.SetDefault("slave.getwork_bind", "0.0.0.0:8888")
 
 	// Mining defaults
 	v.SetDefault("mining.initial_difficulty", 1000000)
@@ -214,6 +254,9 @@ func setDefaults(v *viper.Viper) {
 
 	// PPLNS defaults
 	v.SetDefault("pplns.window", 2.0)
+	v.SetDefault("pplns.dynamic_window", false)
+	v.SetDefault("pplns.min_window", 0.5)
+	v.SetDefault("pplns.max_window", 4.0)
 
 	// Payouts defaults
 	v.SetDefault("payouts.enabled", true)
@@ -222,12 +265,23 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("payouts.max_addresses_per_tx", 100)
 	v.SetDefault("payouts.gas_limit", 21000)
 	v.SetDefault("payouts.gas_price", "auto")
+	v.SetDefault("payouts.withdrawal_fee", 0)        // No fixed fee by default
+	v.SetDefault("payouts.withdrawal_fee_rate", 0.0) // No percentage fee by default
 
 	// API defaults
 	v.SetDefault("api.enabled", true)
 	v.SetDefault("api.bind", "0.0.0.0:8080")
 	v.SetDefault("api.stats_cache", "10s")
 	v.SetDefault("api.cors_origins", []string{"*"})
+	v.SetDefault("api.admin_enabled", false)
+	v.SetDefault("api.admin_password", "")
+
+	// Notify defaults
+	v.SetDefault("notify.enabled", false)
+	v.SetDefault("notify.discord_url", "")
+	v.SetDefault("notify.telegram_bot", "")
+	v.SetDefault("notify.telegram_chat", "")
+	v.SetDefault("notify.pool_url", "")
 
 	// Security defaults
 	v.SetDefault("security.max_connections_per_ip", 100)
@@ -251,8 +305,16 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("pool.fee must be between 0 and 100")
 	}
 
-	if c.Node.URL == "" {
-		return fmt.Errorf("node.url is required")
+	// Either node.url or node.upstreams must be configured
+	if c.Node.URL == "" && len(c.Node.Upstreams) == 0 {
+		return fmt.Errorf("node.url or node.upstreams is required")
+	}
+
+	// Validate upstream configs
+	for i, upstream := range c.Node.Upstreams {
+		if upstream.URL == "" {
+			return fmt.Errorf("node.upstreams[%d].url is required", i)
+		}
 	}
 
 	if c.Master.Enabled && c.Master.Secret == "" {

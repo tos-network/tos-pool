@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/tos-network/tos-pool/internal/config"
+	"github.com/tos-network/tos-pool/internal/notify"
 	"github.com/tos-network/tos-pool/internal/rpc"
 	"github.com/tos-network/tos-pool/internal/storage"
 	"github.com/tos-network/tos-pool/internal/toshash"
@@ -20,13 +21,15 @@ const (
 	TxConfirmTimeout  = 5 * time.Minute  // Max time to wait for TX confirmation
 	TxConfirmPollRate = 5 * time.Second  // How often to check for confirmation
 	MinPeersForPayout = 3                // Minimum peers required for payout
+	OrphanSearchRange = 16               // Search ±16 blocks for orphan detection
 )
 
 // Master is the pool coordinator
 type Master struct {
-	cfg     *config.Config
-	redis   *storage.RedisClient
-	node    *rpc.TOSClient
+	cfg      *config.Config
+	redis    *storage.RedisClient
+	upstream *rpc.UpstreamManager
+	notifier *notify.Notifier
 
 	// Current state
 	currentHeight  uint64
@@ -84,12 +87,24 @@ type ShareResult struct {
 }
 
 // NewMaster creates a new pool master
-func NewMaster(cfg *config.Config, redis *storage.RedisClient, node *rpc.TOSClient) *Master {
+func NewMaster(cfg *config.Config, redis *storage.RedisClient, upstream *rpc.UpstreamManager) *Master {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Initialize notifier
+	notifyCfg := &notify.WebhookConfig{
+		Enabled:      cfg.Notify.Enabled,
+		DiscordURL:   cfg.Notify.DiscordURL,
+		TelegramBot:  cfg.Notify.TelegramBot,
+		TelegramChat: cfg.Notify.TelegramChat,
+		PoolName:     cfg.Pool.Name,
+		PoolURL:      cfg.Notify.PoolURL,
+	}
+
 	return &Master{
 		cfg:           cfg,
 		redis:         redis,
-		node:          node,
+		upstream:      upstream,
+		notifier:      notify.NewNotifier(notifyCfg),
 		shareChan:     make(chan *ShareSubmission, 10000),
 		jobUpdateChan: make(chan struct{}, 1),
 		ctx:           ctx,
@@ -168,10 +183,17 @@ func (m *Master) jobRefreshLoop() {
 
 // refreshJob fetches a new job from the node
 func (m *Master) refreshJob() error {
-	template, err := m.node.GetWork(m.ctx)
+	node := m.upstream.GetClient()
+	if node == nil {
+		return fmt.Errorf("no upstream available")
+	}
+
+	template, err := node.GetWork(m.ctx)
 	if err != nil {
+		m.upstream.RecordFailure()
 		return err
 	}
+	m.upstream.RecordSuccess()
 
 	// Check if height changed
 	if template.Height == m.currentHeight && m.currentJob != nil {
@@ -313,8 +335,14 @@ func (m *Master) processShare(share *ShareSubmission) *ShareResult {
 		util.Infof("BLOCK FOUND! Height: %d, Hash: %s, Finder: %s",
 			job.Height, util.BytesToHex(hash), share.Address)
 
-		// Submit to node
-		success, err := m.node.SubmitWork(m.ctx, share.Nonce, util.BytesToHex(job.HeaderHash), util.BytesToHex(hash))
+		// Submit to node with failover
+		node := m.upstream.GetClient()
+		if node == nil {
+			util.Error("Block submission failed: no upstream available")
+			return &ShareResult{Valid: true, Block: true, Message: "Block found but submission failed"}
+		}
+
+		success, err := node.SubmitWork(m.ctx, share.Nonce, util.BytesToHex(job.HeaderHash), util.BytesToHex(hash))
 		if err != nil {
 			util.Errorf("Block submission failed: %v", err)
 		} else if success {
@@ -333,6 +361,9 @@ func (m *Master) processShare(share *ShareSubmission) *ShareResult {
 			if err := m.redis.WriteBlock(block); err != nil {
 				util.Errorf("Failed to store block: %v", err)
 			}
+
+			// Send notification
+			m.notifier.NotifyBlockFound(block, m.currentDiff)
 
 			m.lastBlockTime = time.Now()
 		}
@@ -362,12 +393,20 @@ func (m *Master) unlockerLoop() {
 
 // processBlocks handles block maturation
 func (m *Master) processBlocks() {
+	node := m.upstream.GetClient()
+	if node == nil {
+		util.Warn("Block processing skipped: no upstream available")
+		return
+	}
+
 	// Get current height
-	netInfo, err := m.node.GetNetworkInfo(m.ctx)
+	netInfo, err := node.GetNetworkInfo(m.ctx)
 	if err != nil {
+		m.upstream.RecordFailure()
 		util.Warnf("Failed to get network info: %v", err)
 		return
 	}
+	m.upstream.RecordSuccess()
 
 	currentHeight := netInfo.Height
 
@@ -381,25 +420,48 @@ func (m *Master) processBlocks() {
 	for _, block := range candidates {
 		confirmations := currentHeight - block.Height
 
-		// Check if block is still in main chain
-		nodeBlock, err := m.node.GetBlockByNumber(m.ctx, block.Height)
+		// Deep orphan detection: search ±16 blocks for our hash
+		// This handles chain reorganizations better than simple height check
+		foundBlock, err := node.SearchBlockByHash(m.ctx, block.Hash, block.Height, OrphanSearchRange)
 		if err != nil {
+			util.Warnf("Error searching for block %d: %v", block.Height, err)
 			continue
 		}
 
-		if nodeBlock == nil || nodeBlock.Hash != block.Hash {
-			// Orphan block
-			util.Warnf("Block %d orphaned: %s", block.Height, block.Hash)
+		if foundBlock == nil {
+			// Block not found in ±16 range - definitely orphaned
+			util.Warnf("Block %d orphaned (not found in ±%d range): %s",
+				block.Height, OrphanSearchRange, block.Hash)
+			m.notifier.NotifyOrphanBlock(block)
 			m.redis.RemoveOrphanBlock(block)
 			continue
 		}
 
-		// Update reward from node
-		block.Reward = nodeBlock.Reward
+		// Block found - check if height changed (reorg)
+		if foundBlock.Height != block.Height {
+			util.Infof("Block %s moved from height %d to %d (reorg)",
+				block.Hash[:16], block.Height, foundBlock.Height)
+			block.Height = foundBlock.Height
+		}
+
+		// Update reward from node (base reward)
+		block.Reward = foundBlock.Reward
+
+		// Calculate and add transaction fees to reward
+		txFees, err := node.GetBlockTxFees(m.ctx, block.Height)
+		if err == nil && txFees > 0 {
+			block.Reward += txFees
+			util.Debugf("Block %d: base reward %d + tx fees %d = %d",
+				block.Height, foundBlock.Reward, txFees, block.Reward)
+		}
+
+		// Recalculate confirmations based on actual height
+		confirmations = currentHeight - block.Height
 
 		if confirmations >= m.cfg.Unlocker.MatureDepth {
 			// Move to matured
-			util.Infof("Block %d matured with %d confirmations", block.Height, confirmations)
+			util.Infof("Block %d matured with %d confirmations (reward: %d)",
+				block.Height, confirmations, block.Reward)
 			m.redis.MoveBlockToMatured(block)
 		} else if confirmations >= m.cfg.Unlocker.ImmatureDepth {
 			// Move to immature
@@ -427,12 +489,20 @@ func (m *Master) payoutLoop() {
 
 // processPayouts sends payments to miners
 func (m *Master) processPayouts() {
+	node := m.upstream.GetClient()
+	if node == nil {
+		util.Warn("Payout skipped: no upstream available")
+		return
+	}
+
 	// 1. Check node connectivity and peer count
-	netInfo, err := m.node.GetNetworkInfo(m.ctx)
+	netInfo, err := node.GetNetworkInfo(m.ctx)
 	if err != nil {
+		m.upstream.RecordFailure()
 		util.Warnf("Payout skipped: cannot get network info: %v", err)
 		return
 	}
+	m.upstream.RecordSuccess()
 
 	if netInfo.PeerCount < MinPeersForPayout {
 		util.Warnf("Payout skipped: insufficient peers (%d < %d)", netInfo.PeerCount, MinPeersForPayout)
@@ -485,6 +555,12 @@ func (m *Master) processPayouts() {
 
 // processBatchPayout sends a batch of payments
 func (m *Master) processBatchPayout(miners []*storage.Miner) {
+	node := m.upstream.GetClient()
+	if node == nil {
+		util.Warn("Batch payout skipped: no upstream available")
+		return
+	}
+
 	// Calculate pool fee
 	feePercent := m.cfg.Pool.Fee / 100.0
 
@@ -502,7 +578,7 @@ func (m *Master) processBatchPayout(miners []*storage.Miner) {
 		util.Infof("Paying %d to %s (fee: %d)", payout, miner.Address[:16], fee)
 
 		// 2. Send transaction
-		txHash, err := m.node.SendTransaction(m.ctx, miner.Address, payout)
+		txHash, err := node.SendTransaction(m.ctx, miner.Address, payout)
 		if err != nil {
 			util.Errorf("Failed to send payment to %s: %v", miner.Address, err)
 			// Rollback: restore balance from pending
@@ -554,7 +630,11 @@ func (m *Master) waitForTxConfirmation(txHash string) (bool, error) {
 			}
 
 			// Check if TX is mined
-			receipt, err := m.node.GetTransactionReceipt(m.ctx, txHash)
+			node := m.upstream.GetClient()
+			if node == nil {
+				continue
+			}
+			receipt, err := node.GetTransactionReceipt(m.ctx, txHash)
 			if err != nil {
 				// TX not yet mined, continue waiting
 				util.Debugf("Waiting for TX %s...", txHash[:16])
@@ -594,10 +674,17 @@ func (m *Master) statsUpdateLoop() {
 
 // updateStats updates network statistics in Redis
 func (m *Master) updateStats() {
-	netInfo, err := m.node.GetNetworkInfo(m.ctx)
-	if err != nil {
+	node := m.upstream.GetClient()
+	if node == nil {
 		return
 	}
+
+	netInfo, err := node.GetNetworkInfo(m.ctx)
+	if err != nil {
+		m.upstream.RecordFailure()
+		return
+	}
+	m.upstream.RecordSuccess()
 
 	stats := &storage.NetworkStats{
 		Height:     netInfo.Height,
@@ -620,4 +707,87 @@ func (m *Master) GetStats() (*storage.PoolStats, error) {
 // GetNetworkStats returns network statistics
 func (m *Master) GetNetworkStats() (*storage.NetworkStats, error) {
 	return m.redis.GetNetworkStats()
+}
+
+// GetDynamicPPLNSWindow calculates the optimal PPLNS window based on pool/network hashrate ratio
+// This helps adjust rewards distribution to match the pool's actual mining power
+func (m *Master) GetDynamicPPLNSWindow() float64 {
+	if !m.cfg.PPLNS.DynamicWindow {
+		return m.cfg.PPLNS.Window
+	}
+
+	// Get pool and network hashrates
+	poolStats, err := m.redis.GetPoolStats(m.cfg.Validation.HashrateWindow, m.cfg.Validation.HashrateLargeWindow)
+	if err != nil || poolStats == nil || poolStats.Hashrate == 0 {
+		return m.cfg.PPLNS.Window
+	}
+
+	netStats, err := m.redis.GetNetworkStats()
+	if err != nil || netStats == nil || netStats.Hashrate == 0 {
+		return m.cfg.PPLNS.Window
+	}
+
+	// Calculate pool's share of network hashrate
+	poolRatio := poolStats.Hashrate / netStats.Hashrate
+
+	// Dynamic window calculation:
+	// - If pool has 50% of network: window = base window
+	// - If pool has 10% of network: window = base window * 5 (more shares needed)
+	// - If pool has 100% of network: window = base window * 0.5 (fewer shares needed)
+	//
+	// Formula: window = baseWindow / (poolRatio * 2)
+	// Clamped to min/max bounds
+
+	var dynamicWindow float64
+	if poolRatio > 0 {
+		dynamicWindow = m.cfg.PPLNS.Window / (poolRatio * 2)
+	} else {
+		dynamicWindow = m.cfg.PPLNS.MaxWindow
+	}
+
+	// Clamp to configured bounds
+	if dynamicWindow < m.cfg.PPLNS.MinWindow {
+		dynamicWindow = m.cfg.PPLNS.MinWindow
+	}
+	if dynamicWindow > m.cfg.PPLNS.MaxWindow {
+		dynamicWindow = m.cfg.PPLNS.MaxWindow
+	}
+
+	util.Debugf("Dynamic PPLNS: pool ratio=%.4f%%, window=%.2f", poolRatio*100, dynamicWindow)
+
+	return dynamicWindow
+}
+
+// GetPPLNSShareWindow returns the number of shares to include in PPLNS calculation
+func (m *Master) GetPPLNSShareWindow() uint64 {
+	window := m.GetDynamicPPLNSWindow()
+
+	// Window is multiplied by network difficulty to get share count
+	// This means if window=2.0 and diff=1000000, we look at last 2000000 worth of shares
+	return uint64(window * float64(m.currentDiff))
+}
+
+// GetUpstreamStates returns the health status of all upstream nodes
+func (m *Master) GetUpstreamStates() []rpc.UpstreamState {
+	return m.upstream.GetUpstreamStates()
+}
+
+// GetActiveUpstream returns the name of the currently active upstream
+func (m *Master) GetActiveUpstream() string {
+	return m.upstream.GetActiveUpstream()
+}
+
+// HasHealthyUpstream returns true if at least one upstream is healthy
+func (m *Master) HasHealthyUpstream() bool {
+	return m.upstream.HasHealthyUpstream()
+}
+
+// UpstreamCount returns the number of configured upstreams
+func (m *Master) UpstreamCount() int {
+	return m.upstream.UpstreamCount()
+}
+
+// HealthyUpstreamCount returns the number of healthy upstreams
+func (m *Master) HealthyUpstreamCount() int {
+	return m.upstream.HealthyCount()
 }

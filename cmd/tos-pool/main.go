@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -72,8 +73,11 @@ func main() {
 	}
 	defer redis.Close()
 
-	// Connect to TOS node
-	node := rpc.NewTOSClient(cfg.Node.URL, cfg.Node.Timeout)
+	// Create upstream manager with multi-node failover support
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	upstreamMgr := rpc.NewUpstreamManager(ctx, &cfg.Node)
+	upstreamMgr.Start()
 
 	var masterCoord *master.Master
 	var stratum *slave.StratumServer
@@ -88,7 +92,7 @@ func main() {
 
 	// Start master if enabled
 	if cfg.Master.Enabled {
-		masterCoord = master.NewMaster(cfg, redis, node)
+		masterCoord = master.NewMaster(cfg, redis, upstreamMgr)
 		if err := masterCoord.Start(); err != nil {
 			util.Fatalf("Failed to start master: %v", err)
 		}
@@ -96,6 +100,26 @@ func main() {
 		// Start API server
 		if cfg.API.Enabled {
 			apiServer = api.NewServer(cfg, redis)
+
+			// Wire up upstream state callback for monitoring
+			apiServer.SetUpstreamStateFunc(func() []api.UpstreamStatus {
+				states := upstreamMgr.GetUpstreamStates()
+				result := make([]api.UpstreamStatus, len(states))
+				for i, s := range states {
+					result[i] = api.UpstreamStatus{
+						Name:         s.Name,
+						URL:          s.URL,
+						Healthy:      s.Healthy,
+						ResponseTime: float64(s.ResponseTime.Milliseconds()),
+						Height:       s.Height,
+						Weight:       s.Weight,
+						FailCount:    s.FailCount,
+						SuccessCount: s.SuccessCount,
+					}
+				}
+				return result
+			})
+
 			if err := apiServer.Start(); err != nil {
 				util.Fatalf("Failed to start API server: %v", err)
 			}
@@ -171,6 +195,7 @@ func main() {
 	if policyServer != nil {
 		policyServer.Stop()
 	}
+	upstreamMgr.Stop()
 
 	util.Info("Pool stopped")
 }

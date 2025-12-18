@@ -29,6 +29,18 @@ type Config struct {
 	ConnectionGrace   time.Duration // Grace period after startup
 	LimitJump         int32         // How much to increase limit on valid share
 
+	// Score-based rate limiting
+	ScoreEnabled      bool
+	MaxScore          int32         // Maximum score before temporary ban
+	ScoreResetTime    time.Duration // How often to reset scores
+	ScoreTempBanTime  time.Duration // How long to temp ban when max score reached
+
+	// Action costs (added to score)
+	CostInvalidShare  int32 // Cost for invalid share
+	CostMalformed     int32 // Cost for malformed request
+	CostConnection    int32 // Cost for new connection
+	CostAuth          int32 // Cost for authorization attempt
+
 	// Reset intervals
 	ResetInterval     time.Duration // How often to reset stats
 	RefreshInterval   time.Duration // How often to refresh blacklist/whitelist
@@ -49,6 +61,16 @@ func DefaultConfig() *Config {
 		ConnectionGrace:   5 * time.Minute,
 		LimitJump:         5,
 
+		// Score-based rate limiting defaults
+		ScoreEnabled:      true,
+		MaxScore:          100,
+		ScoreResetTime:    1 * time.Minute,
+		ScoreTempBanTime:  5 * time.Minute,
+		CostInvalidShare:  10,
+		CostMalformed:     25,
+		CostConnection:    1,
+		CostAuth:          2,
+
 		ResetInterval:     1 * time.Hour,
 		RefreshInterval:   5 * time.Minute,
 	}
@@ -64,6 +86,8 @@ type IPStats struct {
 	Malformed     int32  // Count of malformed requests
 	ConnLimit     int32  // Remaining connection allowance
 	Banned        int32  // 1 = banned, 0 = not banned
+	Score         int32  // Score-based rate limiting score
+	LastScoreReset int64 // When score was last reset
 }
 
 // PolicyServer manages security policies
@@ -388,6 +412,71 @@ func (p *PolicyServer) ApplySharePolicy(ip string, valid bool) bool {
 	}
 
 	return true
+}
+
+// AddScore adds to an IP's score and returns false if banned
+func (p *PolicyServer) AddScore(ip string, cost int32) bool {
+	if !p.config.ScoreEnabled {
+		return true
+	}
+
+	stats := p.getStats(ip)
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
+
+	now := time.Now().Unix()
+
+	// Reset score if enough time passed
+	if now-stats.LastScoreReset >= int64(p.config.ScoreResetTime.Seconds()) {
+		stats.Score = 0
+		stats.LastScoreReset = now
+	}
+
+	// Add cost to score
+	stats.Score += cost
+
+	// Check if max score exceeded
+	if stats.Score >= p.config.MaxScore {
+		util.Warnf("Score limit exceeded for %s: %d >= %d", ip, stats.Score, p.config.MaxScore)
+		stats.Score = 0 // Reset score
+
+		// Temporary ban
+		if p.config.ScoreTempBanTime > 0 {
+			stats.BannedAt = time.Now().UnixMilli()
+			atomic.StoreInt32(&stats.Banned, 1)
+		}
+		return false
+	}
+
+	return true
+}
+
+// GetScore returns current score for an IP
+func (p *PolicyServer) GetScore(ip string) int32 {
+	stats := p.getStats(ip)
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
+	return stats.Score
+}
+
+// ApplyConnectionScore applies connection cost
+func (p *PolicyServer) ApplyConnectionScore(ip string) bool {
+	return p.AddScore(ip, p.config.CostConnection)
+}
+
+// ApplyAuthScore applies authorization cost
+func (p *PolicyServer) ApplyAuthScore(ip string) bool {
+	return p.AddScore(ip, p.config.CostAuth)
+}
+
+// ApplyInvalidShareScore applies invalid share cost
+func (p *PolicyServer) ApplyInvalidShareScore(ip string) bool {
+	return p.AddScore(ip, p.config.CostInvalidShare)
+}
+
+// ApplyMalformedScore applies malformed request cost
+func (p *PolicyServer) ApplyMalformedScore(ip string) bool {
+	return p.AddScore(ip, p.config.CostMalformed)
 }
 
 // BanIP bans an IP address
