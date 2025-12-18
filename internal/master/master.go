@@ -22,6 +22,7 @@ const (
 	TxConfirmPollRate = 5 * time.Second  // How often to check for confirmation
 	MinPeersForPayout = 3                // Minimum peers required for payout
 	OrphanSearchRange = 16               // Search ±16 blocks for orphan detection
+	MaxJobBacklog     = 3                // Number of previous jobs to keep for stale share prevention
 )
 
 // Master is the pool coordinator
@@ -38,6 +39,7 @@ type Master struct {
 
 	// Job management
 	currentJob     *Job
+	jobBacklog     map[string]*Job // Job ID -> Job for stale share prevention
 	jobMu          sync.RWMutex
 	jobUpdateChan  chan struct{}
 
@@ -70,13 +72,15 @@ type Job struct {
 
 // ShareSubmission represents a share from a miner
 type ShareSubmission struct {
-	Address    string
-	Worker     string
-	JobID      string
-	Nonce      string
-	Difficulty uint64
-	Height     uint64
-	ResultChan chan *ShareResult
+	Address        string
+	Worker         string
+	JobID          string
+	Nonce          string
+	Difficulty     uint64
+	Height         uint64
+	TrustScore     int  // Trust score of the submitting miner
+	SkipValidation bool // If true, skip PoW validation (for trusted miners)
+	ResultChan     chan *ShareResult
 }
 
 // ShareResult is the result of share validation
@@ -106,6 +110,7 @@ func NewMaster(cfg *config.Config, redis *storage.RedisClient, upstream *rpc.Ups
 		upstream:      upstream,
 		notifier:      notify.NewNotifier(notifyCfg),
 		shareChan:     make(chan *ShareSubmission, 10000),
+		jobBacklog:    make(map[string]*Job),
 		jobUpdateChan: make(chan struct{}, 1),
 		ctx:           ctx,
 		cancel:        cancel,
@@ -224,9 +229,17 @@ func (m *Master) refreshJob() error {
 	}
 
 	m.jobMu.Lock()
+	// Add current job to backlog before replacing
+	if m.currentJob != nil {
+		m.jobBacklog[m.currentJob.ID] = m.currentJob
+	}
+
 	m.currentJob = job
 	m.currentHeight = template.Height
 	m.currentDiff = template.Difficulty
+
+	// Clean up old jobs from backlog (keep only last N at current or recent heights)
+	m.pruneJobBacklog()
 	m.jobMu.Unlock()
 
 	// Signal new job available
@@ -236,9 +249,33 @@ func (m *Master) refreshJob() error {
 		// Channel full, skip
 	}
 
-	util.Debugf("New job %s at height %d, diff %d", job.ID, job.Height, job.Difficulty)
+	util.Debugf("New job %s at height %d, diff %d (backlog: %d jobs)",
+		job.ID, job.Height, job.Difficulty, len(m.jobBacklog))
 
 	return nil
+}
+
+// pruneJobBacklog removes old jobs from the backlog
+// Must be called with jobMu held
+func (m *Master) pruneJobBacklog() {
+	if len(m.jobBacklog) <= MaxJobBacklog {
+		return
+	}
+
+	// Find the minimum height we should keep (current height - MaxJobBacklog)
+	minHeight := m.currentHeight
+	if minHeight > MaxJobBacklog {
+		minHeight -= MaxJobBacklog
+	} else {
+		minHeight = 0
+	}
+
+	// Remove jobs older than minHeight
+	for id, job := range m.jobBacklog {
+		if job.Height < minHeight {
+			delete(m.jobBacklog, id)
+		}
+	}
 }
 
 // GetCurrentJob returns the current mining job
@@ -278,17 +315,26 @@ func (m *Master) shareProcessLoop() {
 // processShare validates a submitted share
 func (m *Master) processShare(share *ShareSubmission) *ShareResult {
 	m.jobMu.RLock()
+	// First check current job
 	job := m.currentJob
-	m.jobMu.RUnlock()
-
 	if job == nil {
+		m.jobMu.RUnlock()
 		return &ShareResult{Valid: false, Message: "No active job"}
 	}
 
-	// Check job ID
+	// Check if share matches current job
 	if share.JobID != job.ID {
-		return &ShareResult{Valid: false, Message: "Stale job"}
+		// Check job backlog for stale share prevention
+		if backlogJob, ok := m.jobBacklog[share.JobID]; ok {
+			// Share is for a recent job - accept it
+			job = backlogJob
+			util.Debugf("Accepting share for backlog job %s (current: %s)", share.JobID, m.currentJob.ID)
+		} else {
+			m.jobMu.RUnlock()
+			return &ShareResult{Valid: false, Message: "Stale job"}
+		}
 	}
+	m.jobMu.RUnlock()
 
 	// Parse nonce
 	nonce, err := util.HexToBytes(share.Nonce)
@@ -296,21 +342,46 @@ func (m *Master) processShare(share *ShareSubmission) *ShareResult {
 		return &ShareResult{Valid: false, Message: "Invalid nonce"}
 	}
 
-	// Build header with nonce
-	header := make([]byte, toshash.InputSize)
-	copy(header, job.HeaderHash)
-	copy(header[72:80], nonce)
+	var hash []byte
+	var actualDiff uint64
 
-	// Compute hash
-	hash := toshash.Hash(header)
-	if hash == nil {
-		return &ShareResult{Valid: false, Message: "Hash computation failed"}
+	// Trust-based validation: skip expensive PoW computation for trusted miners
+	// BUT always validate if share claims to meet block difficulty
+	if share.SkipValidation && share.Difficulty < job.Difficulty {
+		// Trusted miner, non-block share - skip PoW validation
+		// Trust the claimed difficulty and accept the share
+		util.Debugf("Trust-based skip: miner %s (trust=%d) share at diff %d",
+			share.Address[:12], share.TrustScore, share.Difficulty)
+		actualDiff = share.Difficulty
+		hash = nil // Hash not computed
+	} else {
+		// Full PoW validation required:
+		// - New/untrusted miner, OR
+		// - Trusted miner selected for random validation, OR
+		// - Share claims to meet block difficulty (potential block)
+
+		// Build header with nonce
+		header := make([]byte, toshash.InputSize)
+		copy(header, job.HeaderHash)
+		copy(header[72:80], nonce)
+
+		// Compute hash
+		hash = toshash.Hash(header)
+		if hash == nil {
+			return &ShareResult{Valid: false, Message: "Hash computation failed"}
+		}
+
+		// Check share difficulty
+		actualDiff = toshash.HashToDifficulty(hash)
+		if actualDiff < share.Difficulty {
+			return &ShareResult{Valid: false, Message: "Low difficulty share"}
+		}
 	}
 
-	// Check share difficulty
-	actualDiff := toshash.HashToDifficulty(hash)
-	if actualDiff < share.Difficulty {
-		return &ShareResult{Valid: false, Message: "Low difficulty share"}
+	// Determine hash string for storage
+	hashStr := ""
+	if hash != nil {
+		hashStr = util.BytesToHex(hash)
 	}
 
 	// Store share
@@ -319,7 +390,7 @@ func (m *Master) processShare(share *ShareSubmission) *ShareResult {
 		Worker:     share.Worker,
 		JobID:      share.JobID,
 		Nonce:      share.Nonce,
-		Hash:       util.BytesToHex(hash),
+		Hash:       hashStr,
 		Difficulty: share.Difficulty,
 		Height:     job.Height,
 		Timestamp:  time.Now().Unix(),
@@ -331,7 +402,7 @@ func (m *Master) processShare(share *ShareSubmission) *ShareResult {
 	}
 
 	// Check if block found
-	if actualDiff >= job.Difficulty {
+	if actualDiff >= job.Difficulty && hash != nil {
 		util.Infof("BLOCK FOUND! Height: %d, Hash: %s, Finder: %s",
 			job.Height, util.BytesToHex(hash), share.Address)
 

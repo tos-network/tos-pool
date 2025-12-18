@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net"
 	"strings"
 	"sync"
@@ -64,16 +65,18 @@ type Job struct {
 
 // Share represents a submitted share
 type Share struct {
-	SessionID  uint64
-	Address    string
-	Worker     string
-	JobID      string
-	Nonce      string
-	Hash       string
-	Difficulty uint64
-	Height     uint64
-	Timestamp  int64
-	IsBlock    bool
+	SessionID      uint64
+	Address        string
+	Worker         string
+	JobID          string
+	Nonce          string
+	Hash           string
+	Difficulty     uint64
+	Height         uint64
+	Timestamp      int64
+	IsBlock        bool
+	TrustScore     int  // Current trust score of the miner
+	SkipValidation bool // True if trust-based validation should be skipped
 }
 
 // Session represents a miner connection
@@ -583,6 +586,10 @@ func (s *StratumServer) handleSubmit(session *Session, req *StratumRequest) {
 	// Check if difficulty adjustment needed
 	s.checkVardiff(session)
 
+	// Trust-based validation: check if we should skip PoW validation for trusted miners
+	share.TrustScore = session.TrustScore
+	share.SkipValidation = s.shouldSkipValidation(session)
+
 	// Accept share (actual validation done by callback)
 	atomic.AddUint64(&session.ValidShares, 1)
 	session.TrustScore++
@@ -611,6 +618,34 @@ func (s *StratumServer) ReportInvalidShare(sessionID uint64, ip string) {
 			}
 		}
 	}
+}
+
+// shouldSkipValidation checks if PoW validation can be skipped for trusted miners
+// This implements trust-based probabilistic validation to save CPU on high-hashrate pools
+func (s *StratumServer) shouldSkipValidation(session *Session) bool {
+	// If trust threshold not configured, always validate
+	if s.cfg.Validation.TrustThreshold <= 0 {
+		return false
+	}
+
+	// If miner hasn't reached trust threshold, always validate
+	if session.TrustScore < s.cfg.Validation.TrustThreshold {
+		return false
+	}
+
+	// Miner is trusted - use probabilistic validation
+	// TrustCheckPercent determines what percentage of shares to validate
+	// e.g., if TrustCheckPercent=75, we validate 75% and skip 25%
+	if s.cfg.Validation.TrustCheckPercent >= 100 {
+		return false // Validate all shares
+	}
+	if s.cfg.Validation.TrustCheckPercent <= 0 {
+		return true // Skip all validation (not recommended)
+	}
+
+	// Random check: validate TrustCheckPercent% of shares
+	// Skip validation if random value >= TrustCheckPercent
+	return rand.Intn(100) >= s.cfg.Validation.TrustCheckPercent
 }
 
 // checkVardiff checks if difficulty adjustment is needed

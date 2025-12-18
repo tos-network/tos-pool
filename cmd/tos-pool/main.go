@@ -154,12 +154,14 @@ func main() {
 		shareCallback := func(share *slave.Share) {
 			if masterCoord != nil {
 				submission := &master.ShareSubmission{
-					Address:    share.Address,
-					Worker:     share.Worker,
-					JobID:      share.JobID,
-					Nonce:      share.Nonce,
-					Difficulty: share.Difficulty,
-					Height:     share.Height,
+					Address:        share.Address,
+					Worker:         share.Worker,
+					JobID:          share.JobID,
+					Nonce:          share.Nonce,
+					Difficulty:     share.Difficulty,
+					Height:         share.Height,
+					TrustScore:     share.TrustScore,
+					SkipValidation: share.SkipValidation,
 				}
 				masterCoord.SubmitShare(submission)
 			}

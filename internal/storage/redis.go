@@ -1256,3 +1256,70 @@ func (r *RedisClient) getHashrateHistory(key string, since int64) ([]HashratePoi
 
 	return points, nil
 }
+
+// WorkerStats represents statistics for a single worker
+type WorkerStats struct {
+	Name     string  `json:"name"`
+	Hashrate float64 `json:"hashrate"`
+	LastSeen int64   `json:"last_seen"`
+}
+
+// GetMinerWorkers returns worker statistics for a miner
+func (r *RedisClient) GetMinerWorkers(address string, window time.Duration) ([]WorkerStats, error) {
+	// Get worker last seen times
+	workerKey := fmt.Sprintf(keyMinerWorkers, address)
+	workers, err := r.client.HGetAll(r.ctx, workerKey).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(workers) == 0 {
+		return []WorkerStats{}, nil
+	}
+
+	// Get all shares in the hashrate window for this miner
+	minTime := time.Now().Add(-window).Unix()
+	addrKey := fmt.Sprintf(keyHashrateAddr, address)
+
+	results, err := r.client.ZRangeByScore(r.ctx, addrKey, &redis.ZRangeBy{
+		Min: strconv.FormatInt(minTime, 10),
+		Max: "+inf",
+	}).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	// Aggregate difficulty by worker
+	workerDiff := make(map[string]uint64)
+	for _, result := range results {
+		// Format: "difficulty:address:worker:ms"
+		parts := strings.Split(result, ":")
+		if len(parts) >= 3 {
+			diff, _ := strconv.ParseUint(parts[0], 10, 64)
+			worker := parts[2]
+			workerDiff[worker] += diff
+		}
+	}
+
+	// Build worker stats
+	stats := make([]WorkerStats, 0, len(workers))
+	windowSecs := window.Seconds()
+
+	for name, lastSeenStr := range workers {
+		lastSeen, _ := strconv.ParseInt(lastSeenStr, 10, 64)
+
+		// Calculate hashrate for this worker
+		hashrate := float64(0)
+		if diff, ok := workerDiff[name]; ok && windowSecs > 0 {
+			hashrate = float64(diff) / windowSecs
+		}
+
+		stats = append(stats, WorkerStats{
+			Name:     name,
+			Hashrate: hashrate,
+			LastSeen: lastSeen,
+		})
+	}
+
+	return stats, nil
+}

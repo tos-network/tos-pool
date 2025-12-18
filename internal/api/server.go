@@ -338,6 +338,17 @@ func (s *Server) handleMiner(c *gin.Context) {
 	// Get recent payments
 	payments, _ := s.redis.GetMinerPayments(address, 20)
 
+	// Get worker statistics
+	workerStats, _ := s.redis.GetMinerWorkers(address, s.cfg.Validation.HashrateWindow)
+	workers := make([]WorkerStats, len(workerStats))
+	for i, w := range workerStats {
+		workers[i] = WorkerStats{
+			Name:     w.Name,
+			Hashrate: w.Hashrate,
+			LastSeen: w.LastSeen,
+		}
+	}
+
 	response := MinerResponse{
 		Address:         address,
 		Hashrate:        hashrate,
@@ -348,7 +359,7 @@ func (s *Server) handleMiner(c *gin.Context) {
 		TotalPaid:       miner.TotalPaid,
 		BlocksFound:     miner.BlocksFound,
 		LastShare:       miner.LastShare,
-		Workers:         []WorkerStats{}, // TODO: populate from worker data
+		Workers:         workers,
 		Payments:        payments,
 	}
 
