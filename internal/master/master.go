@@ -60,14 +60,15 @@ type Master struct {
 
 // Job represents a mining job
 type Job struct {
-	ID         string
-	Height     uint64
-	HeaderHash []byte
-	ParentHash []byte
-	Target     []byte
-	Difficulty uint64
-	Timestamp  uint64
-	CreatedAt  time.Time
+	ID             string
+	Height         uint64
+	HeaderHash     []byte // MinerWork format (112 bytes) for miners
+	OriginalHeader []byte // Original BlockHeader for block submission
+	ParentHash     []byte
+	Target         []byte
+	Difficulty     uint64
+	Timestamp      uint64
+	CreatedAt      time.Time
 }
 
 // ShareSubmission represents a share from a miner
@@ -211,21 +212,31 @@ func (m *Master) refreshJob() error {
 		return err
 	}
 
-	// Parse header hash
-	headerHash, err := util.HexToBytes(template.HeaderHash)
+	// Parse original block header from daemon
+	originalHeader, err := util.HexToBytes(template.HeaderHash)
 	if err != nil {
 		return err
 	}
 
+	// Convert BlockHeader to MinerWork format for miners
+	minerWork, err := toshash.BlockHeaderToMinerWork(originalHeader)
+	if err != nil {
+		util.Warnf("Failed to convert BlockHeader to MinerWork: %v (headerLen=%d)", err, len(originalHeader))
+		return err
+	}
+
+	util.Debugf("Job conversion: BlockHeader(%d bytes) -> MinerWork(%d bytes)", len(originalHeader), len(minerWork))
+
 	// Create new job
 	job := &Job{
-		ID:         util.BytesToHexNoPre(headerHash[:8]),
-		Height:     template.Height,
-		HeaderHash: headerHash,
-		Target:     target,
-		Difficulty: template.Difficulty,
-		Timestamp:  template.Timestamp,
-		CreatedAt:  time.Now(),
+		ID:             util.BytesToHexNoPre(minerWork[:8]),
+		Height:         template.Height,
+		HeaderHash:     minerWork,        // MinerWork format for miners
+		OriginalHeader: originalHeader,   // Original BlockHeader for block submission
+		Target:         target,
+		Difficulty:     template.Difficulty,
+		Timestamp:      template.Timestamp,
+		CreatedAt:      time.Now(),
 	}
 
 	m.jobMu.Lock()
@@ -344,6 +355,7 @@ func (m *Master) processShare(share *ShareSubmission) *ShareResult {
 
 	var hash []byte
 	var actualDiff uint64
+	var minerWork []byte // MinerWork with nonce for block submission
 
 	// Trust-based validation: skip expensive PoW computation for trusted miners
 	// BUT always validate if share claims to meet block difficulty
@@ -353,26 +365,35 @@ func (m *Master) processShare(share *ShareSubmission) *ShareResult {
 		util.Debugf("Trust-based skip: miner %s (trust=%d) share at diff %d",
 			share.Address[:12], share.TrustScore, share.Difficulty)
 		actualDiff = share.Difficulty
-		hash = nil // Hash not computed
+		hash = nil      // Hash not computed
+		minerWork = nil // Not needed for non-block shares
 	} else {
 		// Full PoW validation required:
 		// - New/untrusted miner, OR
 		// - Trusted miner selected for random validation, OR
 		// - Share claims to meet block difficulty (potential block)
 
-		// Build header with nonce
-		header := make([]byte, toshash.InputSize)
-		copy(header, job.HeaderHash)
-		copy(header[72:80], nonce)
+		// Build MinerWork header with nonce at NonceOffset (bytes 40-47, big-endian)
+		minerWork = make([]byte, toshash.InputSize)
+		copy(minerWork, job.HeaderHash)
+		copy(minerWork[toshash.NonceOffset:toshash.NonceOffset+8], nonce)
+
+		// Debug: log header and nonce details
+		util.Debugf("Share validation: addr=%s nonce=%s minerWorkLen=%d jobHeaderLen=%d",
+			share.Address[:16], share.Nonce, len(minerWork), len(job.HeaderHash))
+		util.Debugf("Nonce bytes: %x, nonce region in minerWork: %x",
+			nonce, minerWork[toshash.NonceOffset:toshash.NonceOffset+8])
 
 		// Compute hash
-		hash = toshash.Hash(header)
+		hash = toshash.Hash(minerWork)
 		if hash == nil {
 			return &ShareResult{Valid: false, Message: "Hash computation failed"}
 		}
 
 		// Check share difficulty
 		actualDiff = toshash.HashToDifficulty(hash)
+		util.Debugf("Hash result: %x, actualDiff=%d, shareDiff=%d",
+			hash[:16], actualDiff, share.Difficulty)
 		if actualDiff < share.Difficulty {
 			return &ShareResult{Valid: false, Message: "Low difficulty share"}
 		}
@@ -413,7 +434,13 @@ func (m *Master) processShare(share *ShareSubmission) *ShareResult {
 			return &ShareResult{Valid: true, Block: true, Message: "Block found but submission failed"}
 		}
 
-		success, err := node.SubmitWork(m.ctx, share.Nonce, util.BytesToHex(job.HeaderHash), util.BytesToHex(hash))
+		// Submit block with original BlockHeader and MinerWork (with nonce)
+		// daemon expects: block_template (BlockHeader) + miner_work (MinerWork with nonce)
+		// NOTE: Use BytesToHexNoPre - Rust hex::decode doesn't accept 0x prefix
+		success, err := node.SubmitWork(m.ctx,
+			util.BytesToHexNoPre(minerWork),           // miner_work (MinerWork with nonce)
+			util.BytesToHexNoPre(job.OriginalHeader),  // block_template (original BlockHeader)
+			util.BytesToHexNoPre(hash))                // unused mixDigest
 		if err != nil {
 			util.Errorf("Block submission failed: %v", err)
 		} else if success {

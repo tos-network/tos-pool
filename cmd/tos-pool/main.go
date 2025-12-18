@@ -177,7 +177,14 @@ func main() {
 					TrustScore:     share.TrustScore,
 					SkipValidation: share.SkipValidation,
 				}
-				masterCoord.SubmitShare(submission)
+				result := masterCoord.SubmitShare(submission)
+				if result.Valid {
+					util.Infof("Share accepted: addr=%s worker=%s job=%s", share.Address[:16], share.Worker, share.JobID)
+				} else {
+					util.Warnf("Share rejected: addr=%s worker=%s job=%s reason=%s", share.Address[:16], share.Worker, share.JobID, result.Message)
+				}
+			} else {
+				util.Warnf("Share received but master not available")
 			}
 			// Record share in New Relic
 			if nrAgent != nil {

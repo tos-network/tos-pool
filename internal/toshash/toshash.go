@@ -3,6 +3,7 @@ package toshash
 
 import (
 	"encoding/binary"
+	"fmt"
 
 	"github.com/zeebo/blake3"
 )
@@ -28,122 +29,162 @@ const (
 
 	// OutputSize is the hash output size
 	OutputSize = 32
+
+	// NonceOffset is the offset of the nonce in the block header
+	// TOS header structure: work_hash(32) + timestamp(8) + nonce(8) + extra_nonce(32) + miner(32)
+	// Nonce is at bytes 40-47
+	NonceOffset = 40
 )
 
+// Strides for stage 3 (matches canonical Rust v3)
+var strides = [4]int{1, 64, 256, 1024}
+
 // Hash computes TOS Hash V3 for the given input
-// Input: 112 bytes (104-byte header + 8-byte nonce)
+// Input: 112 bytes (MinerWork format)
 // Output: 32-byte hash
+// This implementation matches the canonical Rust tos-hash v3 algorithm
 func Hash(input []byte) []byte {
 	if len(input) != InputSize {
 		return nil
 	}
 
 	// Stage 1: Initialize scratchpad from Blake3(input)
-	scratchpad := initializeScratchpad(input)
+	scratchpad := stage1Init(input)
 
 	// Stage 2: Sequential memory mixing (4 passes)
-	sequentialMixing(scratchpad)
+	stage2Mix(scratchpad)
 
 	// Stage 3: Strided memory mixing (8 rounds)
-	stridedMixing(scratchpad)
+	stage3Strided(scratchpad)
 
 	// Stage 4: XOR-fold and final Blake3
-	return finalize(scratchpad, input)
+	return stage4Finalize(scratchpad)
 }
 
-// initializeScratchpad creates the 64KB scratchpad from the input
-func initializeScratchpad(input []byte) []uint64 {
+// stage1Init creates the 64KB scratchpad from the input
+// Matches canonical Rust v3 stage_1_init
+func stage1Init(input []byte) []uint64 {
 	scratchpad := make([]uint64, MemorySize)
 
-	// Hash input to get initial state
+	// Hash input to get 256-bit seed
 	hasher := blake3.New()
 	hasher.Write(input)
-	seed := hasher.Sum(nil)
+	hash := hasher.Sum(nil)
 
-	// Expand seed to fill scratchpad using Blake3 in counter mode
-	for i := 0; i < MemorySize; i += 4 {
-		h := blake3.New()
+	// Convert to u64 seed values (little-endian)
+	var state [4]uint64
+	for i := 0; i < 4; i++ {
+		state[i] = binary.LittleEndian.Uint64(hash[i*8 : (i+1)*8])
+	}
 
-		// Counter-based expansion
-		var counter [8]byte
-		binary.LittleEndian.PutUint64(counter[:], uint64(i/4))
-
-		h.Write(seed)
-		h.Write(counter[:])
-		block := h.Sum(nil)
-
-		// Each Blake3 output gives us 4 uint64 values
-		for j := 0; j < 4 && i+j < MemorySize; j++ {
-			scratchpad[i+j] = binary.LittleEndian.Uint64(block[j*8 : (j+1)*8])
-		}
+	// Fill scratchpad sequentially using mix function
+	for i := 0; i < MemorySize; i++ {
+		idx := i % 4
+		state[idx] = mix(state[idx], state[(idx+1)%4], i)
+		scratchpad[i] = state[idx]
 	}
 
 	return scratchpad
 }
 
-// sequentialMixing performs forward and backward passes over the scratchpad
-func sequentialMixing(scratchpad []uint64) {
+// stage2Mix performs forward and backward passes over the scratchpad
+// Matches canonical Rust v3 stage_2_mix
+func stage2Mix(scratchpad []uint64) {
 	for pass := 0; pass < MemoryPasses; pass++ {
-		// Forward pass
-		for i := 1; i < MemorySize; i++ {
-			scratchpad[i] ^= mixFunction(scratchpad[i-1], scratchpad[i])
-		}
-
-		// Backward pass
-		for i := MemorySize - 2; i >= 0; i-- {
-			scratchpad[i] ^= mixFunction(scratchpad[i+1], scratchpad[i])
+		if pass%2 == 0 {
+			// Forward pass
+			carry := scratchpad[MemorySize-1]
+			for i := 0; i < MemorySize; i++ {
+				var prev uint64
+				if i > 0 {
+					prev = scratchpad[i-1]
+				} else {
+					prev = scratchpad[MemorySize-1]
+				}
+				scratchpad[i] = mix(scratchpad[i], prev^carry, pass)
+				carry = scratchpad[i]
+			}
+		} else {
+			// Backward pass
+			carry := scratchpad[0]
+			for i := MemorySize - 1; i >= 0; i-- {
+				var next uint64
+				if i < MemorySize-1 {
+					next = scratchpad[i+1]
+				} else {
+					next = scratchpad[0]
+				}
+				scratchpad[i] = mix(scratchpad[i], next^carry, pass)
+				carry = scratchpad[i]
+			}
 		}
 	}
 }
 
-// stridedMixing performs power-of-2 stride mixing
-func stridedMixing(scratchpad []uint64) {
+// stage3Strided performs strided access mixing
+// Matches canonical Rust v3 stage_3_strided
+func stage3Strided(scratchpad []uint64) {
 	for round := 0; round < MixingRounds; round++ {
-		stride := 1 << round // 1, 2, 4, 8, 16, 32, 64, 128
+		stride := strides[round%len(strides)]
 
 		for i := 0; i < MemorySize; i++ {
 			j := (i + stride) % MemorySize
-			scratchpad[i] ^= mixFunction(scratchpad[j], scratchpad[i])
+			k := (i + stride*2) % MemorySize
+
+			// Three-way mixing without branches
+			a := scratchpad[i]
+			b := scratchpad[j]
+			c := scratchpad[k]
+
+			scratchpad[i] = mix(a, b^c, round)
 		}
 	}
 }
 
-// mixFunction is the core mixing operation
-func mixFunction(a, b uint64) uint64 {
-	// Rotate and XOR
-	rotated := rotateRight(a, 17) ^ b
-	// Multiply by constant
-	mixed := rotated * MixConstant
-	// Additional rotation
-	return rotateRight(mixed, 23)
+// mix is the core mixing operation
+// Matches canonical Rust v3 mix function
+func mix(a, b uint64, round int) uint64 {
+	// Rotation amount varies by round to add diffusion
+	rot := uint((round * 7) % 64)
+
+	// Simple arithmetic mixing - no branches
+	x := a + b                     // wrapping add
+	y := a ^ rotateLeft(b, rot)    // XOR with rotated b
+	z := x * MixConstant           // multiply by golden ratio constant
+
+	return z ^ rotateRight(y, rot/2)
+}
+
+// rotateLeft performs a 64-bit left rotation
+func rotateLeft(x uint64, k uint) uint64 {
+	k &= 63
+	return (x << k) | (x >> (64 - k))
 }
 
 // rotateRight performs a 64-bit right rotation
 func rotateRight(x uint64, k uint) uint64 {
+	k &= 63
 	return (x >> k) | (x << (64 - k))
 }
 
-// finalize compresses the scratchpad into the final hash
-func finalize(scratchpad []uint64, input []byte) []byte {
+// stage4Finalize compresses the scratchpad into the final hash
+// Matches canonical Rust v3 stage_4_finalize
+func stage4Finalize(scratchpad []uint64) []byte {
 	// XOR-fold scratchpad into 256 bits (4 uint64)
 	var folded [4]uint64
 	for i := 0; i < MemorySize; i++ {
 		folded[i%4] ^= scratchpad[i]
 	}
 
-	// Final Blake3 hash
-	hasher := blake3.New()
-
-	// Include original input
-	hasher.Write(input)
-
-	// Include folded scratchpad
+	// Convert to bytes (little-endian)
+	var bytes [32]byte
 	for i := 0; i < 4; i++ {
-		var buf [8]byte
-		binary.LittleEndian.PutUint64(buf[:], folded[i])
-		hasher.Write(buf[:])
+		binary.LittleEndian.PutUint64(bytes[i*8:(i+1)*8], folded[i])
 	}
 
+	// Final Blake3 hash for security
+	hasher := blake3.New()
+	hasher.Write(bytes[:])
 	return hasher.Sum(nil)
 }
 
@@ -196,30 +237,29 @@ func HashToDifficulty(hash []byte) uint64 {
 }
 
 // BuildHeader constructs a mining header from components
-func BuildHeader(prevHash, merkleRoot []byte, timestamp, nonce uint64) []byte {
+func BuildHeader(workHash []byte, timestamp, nonce uint64) []byte {
 	header := make([]byte, InputSize)
 
-	// Layout:
-	// [0:32]   Previous block hash
-	// [32:64]  Merkle root
-	// [64:72]  Timestamp (8 bytes, little-endian)
-	// [72:80]  Nonce (8 bytes, little-endian)
-	// [80:112] Extra data / reserved
+	// TOS header layout:
+	// [0:32]   Work hash (Blake3 of block data)
+	// [32:40]  Timestamp (8 bytes, big-endian)
+	// [40:48]  Nonce (8 bytes, big-endian)
+	// [48:80]  Extra nonce (32 bytes)
+	// [80:112] Miner address (32 bytes)
 
-	copy(header[0:32], prevHash)
-	copy(header[32:64], merkleRoot)
-	binary.LittleEndian.PutUint64(header[64:72], timestamp)
-	binary.LittleEndian.PutUint64(header[72:80], nonce)
+	copy(header[0:32], workHash)
+	binary.BigEndian.PutUint64(header[32:40], timestamp)
+	binary.BigEndian.PutUint64(header[NonceOffset:NonceOffset+8], nonce)
 
 	return header
 }
 
 // ValidateShare validates a mining share
 func ValidateShare(header []byte, nonce uint64, shareDifficulty, networkDifficulty uint64) (bool, bool) {
-	// Replace nonce in header
+	// Replace nonce in header at NonceOffset (bytes 40-47, big-endian)
 	workHeader := make([]byte, len(header))
 	copy(workHeader, header)
-	binary.LittleEndian.PutUint64(workHeader[72:80], nonce)
+	binary.BigEndian.PutUint64(workHeader[NonceOffset:NonceOffset+8], nonce)
 
 	// Compute hash
 	hash := Hash(workHeader)
@@ -241,4 +281,176 @@ func ValidateShare(header []byte, nonce uint64, shareDifficulty, networkDifficul
 	}
 
 	return true, false
+}
+
+// BlockHeader represents a parsed TOS block header
+type BlockHeader struct {
+	Version    uint8
+	Height     uint64
+	Timestamp  uint64
+	Nonce      uint64
+	ExtraNonce [32]byte
+	Tips       [][]byte // Each tip is 32 bytes
+	TxsHashes  [][]byte // Each tx hash is 32 bytes
+	Miner      [32]byte
+}
+
+// ParseBlockHeader parses a serialized BlockHeader from the daemon
+// BlockHeader format:
+//   - version: 1 byte
+//   - height: 8 bytes (big-endian)
+//   - timestamp: 8 bytes (big-endian)
+//   - nonce: 8 bytes (big-endian)
+//   - extra_nonce: 32 bytes
+//   - tips_count: 1 byte
+//   - tips: tips_count × 32 bytes
+//   - txs_count: 2 bytes (big-endian)
+//   - txs_hashes: txs_count × 32 bytes
+//   - miner: 32 bytes
+func ParseBlockHeader(data []byte) (*BlockHeader, error) {
+	// Minimum size: 1 + 8 + 8 + 8 + 32 + 1 + 2 + 32 = 92 bytes (no tips, no txs)
+	if len(data) < 92 {
+		return nil, fmt.Errorf("block header too short: %d bytes", len(data))
+	}
+
+	pos := 0
+	header := &BlockHeader{}
+
+	// version (1 byte)
+	header.Version = data[pos]
+	pos++
+
+	// height (8 bytes, big-endian)
+	header.Height = binary.BigEndian.Uint64(data[pos : pos+8])
+	pos += 8
+
+	// timestamp (8 bytes, big-endian)
+	header.Timestamp = binary.BigEndian.Uint64(data[pos : pos+8])
+	pos += 8
+
+	// nonce (8 bytes, big-endian)
+	header.Nonce = binary.BigEndian.Uint64(data[pos : pos+8])
+	pos += 8
+
+	// extra_nonce (32 bytes)
+	copy(header.ExtraNonce[:], data[pos:pos+32])
+	pos += 32
+
+	// tips_count (1 byte)
+	tipsCount := int(data[pos])
+	pos++
+
+	// tips (tips_count × 32 bytes)
+	if pos+tipsCount*32 > len(data) {
+		return nil, fmt.Errorf("block header truncated at tips: need %d bytes, have %d", pos+tipsCount*32, len(data))
+	}
+	header.Tips = make([][]byte, tipsCount)
+	for i := 0; i < tipsCount; i++ {
+		header.Tips[i] = make([]byte, 32)
+		copy(header.Tips[i], data[pos:pos+32])
+		pos += 32
+	}
+
+	// txs_count (2 bytes, big-endian)
+	if pos+2 > len(data) {
+		return nil, fmt.Errorf("block header truncated at txs_count")
+	}
+	txsCount := int(binary.BigEndian.Uint16(data[pos : pos+2]))
+	pos += 2
+
+	// txs_hashes (txs_count × 32 bytes)
+	if pos+txsCount*32 > len(data) {
+		return nil, fmt.Errorf("block header truncated at txs: need %d bytes, have %d", pos+txsCount*32, len(data))
+	}
+	header.TxsHashes = make([][]byte, txsCount)
+	for i := 0; i < txsCount; i++ {
+		header.TxsHashes[i] = make([]byte, 32)
+		copy(header.TxsHashes[i], data[pos:pos+32])
+		pos += 32
+	}
+
+	// miner (32 bytes)
+	if pos+32 > len(data) {
+		return nil, fmt.Errorf("block header truncated at miner")
+	}
+	copy(header.Miner[:], data[pos:pos+32])
+
+	return header, nil
+}
+
+// ComputeTipsHash computes the Blake3 hash of all concatenated tips
+func (h *BlockHeader) ComputeTipsHash() []byte {
+	hasher := blake3.New()
+	for _, tip := range h.Tips {
+		hasher.Write(tip)
+	}
+	return hasher.Sum(nil)
+}
+
+// ComputeTxsHash computes the Blake3 hash of all concatenated tx hashes
+func (h *BlockHeader) ComputeTxsHash() []byte {
+	hasher := blake3.New()
+	for _, tx := range h.TxsHashes {
+		hasher.Write(tx)
+	}
+	return hasher.Sum(nil)
+}
+
+// ComputeWorkHash computes the work hash (immutable part of block)
+// work_hash = Blake3(version(1) + height(8) + tips_hash(32) + txs_hash(32))
+func (h *BlockHeader) ComputeWorkHash() []byte {
+	// Build the work data: version + height + tips_hash + txs_hash
+	workData := make([]byte, 73) // 1 + 8 + 32 + 32 = 73 bytes
+
+	workData[0] = h.Version
+	binary.BigEndian.PutUint64(workData[1:9], h.Height)
+
+	tipsHash := h.ComputeTipsHash()
+	copy(workData[9:41], tipsHash)
+
+	txsHash := h.ComputeTxsHash()
+	copy(workData[41:73], txsHash)
+
+	// Hash to get work_hash
+	hasher := blake3.New()
+	hasher.Write(workData)
+	return hasher.Sum(nil)
+}
+
+// ToMinerWork converts a BlockHeader to MinerWork format (112 bytes)
+// MinerWork format:
+//   - work_hash: 32 bytes (Blake3 of version + height + tips_hash + txs_hash)
+//   - timestamp: 8 bytes (big-endian)
+//   - nonce: 8 bytes (big-endian)
+//   - extra_nonce: 32 bytes
+//   - miner: 32 bytes
+func (h *BlockHeader) ToMinerWork() []byte {
+	minerWork := make([]byte, InputSize) // 112 bytes
+
+	// work_hash (32 bytes)
+	workHash := h.ComputeWorkHash()
+	copy(minerWork[0:32], workHash)
+
+	// timestamp (8 bytes, big-endian)
+	binary.BigEndian.PutUint64(minerWork[32:40], h.Timestamp)
+
+	// nonce (8 bytes, big-endian)
+	binary.BigEndian.PutUint64(minerWork[40:48], h.Nonce)
+
+	// extra_nonce (32 bytes)
+	copy(minerWork[48:80], h.ExtraNonce[:])
+
+	// miner (32 bytes)
+	copy(minerWork[80:112], h.Miner[:])
+
+	return minerWork
+}
+
+// BlockHeaderToMinerWork converts raw BlockHeader bytes to MinerWork format
+func BlockHeaderToMinerWork(blockHeader []byte) ([]byte, error) {
+	header, err := ParseBlockHeader(blockHeader)
+	if err != nil {
+		return nil, err
+	}
+	return header.ToMinerWork(), nil
 }

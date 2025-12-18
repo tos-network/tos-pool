@@ -95,11 +95,11 @@ func Uint64ToHex(n uint64) string {
 
 // ValidateAddress validates TOS address format
 func ValidateAddress(addr string) bool {
-	// TOS addresses start with "tos1" and are 62 characters (bech32)
-	if !strings.HasPrefix(addr, "tos1") {
+	// TOS addresses start with "tos1" (mainnet) or "tst1" (testnet) and are 63 characters (bech32)
+	if !strings.HasPrefix(addr, "tos1") && !strings.HasPrefix(addr, "tst1") {
 		return false
 	}
-	if len(addr) != 62 {
+	if len(addr) != 63 {
 		return false
 	}
 	// Basic bech32 character validation

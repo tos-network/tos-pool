@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -200,6 +201,16 @@ type GetBalanceResult struct {
 	TopoHeight uint64 `json:"topoheight"`
 }
 
+// rpcURL returns the full RPC endpoint URL with /json_rpc path
+func (c *TOSClient) rpcURL() string {
+	// TOS daemon expects RPC calls at /json_rpc endpoint
+	url := c.url
+	if !strings.HasSuffix(url, "/json_rpc") {
+		url = strings.TrimSuffix(url, "/") + "/json_rpc"
+	}
+	return url
+}
+
 // call makes an RPC call using TOS native format (object params)
 func (c *TOSClient) call(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
 	id := atomic.AddUint64(&c.requestID, 1)
@@ -216,7 +227,7 @@ func (c *TOSClient) call(ctx context.Context, method string, params interface{})
 		return nil, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.url, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.rpcURL(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
