@@ -1,8 +1,16 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/tos-network/tos-pool/internal/config"
+	"github.com/tos-network/tos-pool/internal/storage"
 )
 
 func TestWorkerStatsStruct(t *testing.T) {
@@ -231,6 +239,708 @@ func TestWhitelistRequestStruct(t *testing.T) {
 
 	if req.IP != "192.168.1.100" {
 		t.Errorf("WhitelistRequest.IP = %s, want 192.168.1.100", req.IP)
+	}
+}
+
+// setupTestServer creates a test server with miniredis
+func setupTestServer(t *testing.T) (*Server, *miniredis.Miniredis) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("Failed to start miniredis: %v", err)
+	}
+
+	redis, err := storage.NewRedisClient(mr.Addr(), "", 0)
+	if err != nil {
+		mr.Close()
+		t.Fatalf("Failed to create Redis client: %v", err)
+	}
+
+	cfg := &config.Config{
+		API: config.APIConfig{
+			Bind:          ":8080",
+			StatsCache:    5 * time.Second,
+			AdminEnabled:  true,
+			AdminPassword: "testpassword",
+		},
+		Pool: config.PoolConfig{
+			Fee: 1.0,
+		},
+		Validation: config.ValidationConfig{
+			HashrateWindow:      600 * time.Second,
+			HashrateLargeWindow: 3600 * time.Second,
+		},
+	}
+
+	server := NewServer(cfg, redis)
+	return server, mr
+}
+
+func TestNewServer(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	if server == nil {
+		t.Fatal("NewServer returned nil")
+	}
+
+	if server.cfg == nil {
+		t.Error("Server.cfg should not be nil")
+	}
+
+	if server.redis == nil {
+		t.Error("Server.redis should not be nil")
+	}
+
+	if server.router == nil {
+		t.Error("Server.router should not be nil")
+	}
+}
+
+func TestHealthEndpoint(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var response map[string]string
+	json.Unmarshal(w.Body.Bytes(), &response)
+	if response["status"] != "ok" {
+		t.Errorf("Response status = %s, want ok", response["status"])
+	}
+}
+
+func TestCORSHeaders(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("OPTIONS", "/api/stats", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != 204 {
+		t.Errorf("Status = %d, want 204", w.Code)
+	}
+
+	if w.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Error("CORS origin header not set")
+	}
+
+	if w.Header().Get("Access-Control-Allow-Methods") == "" {
+		t.Error("CORS methods header not set")
+	}
+}
+
+func TestHandleStats(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	// Add some test data
+	mr.Set("pool:hashrate", "1500000")
+
+	req := httptest.NewRequest("GET", "/api/stats", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var response StatsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+
+	if response.Pool.Fee != 1.0 {
+		t.Errorf("Pool.Fee = %f, want 1.0", response.Pool.Fee)
+	}
+
+	if response.Now == 0 {
+		t.Error("Now should be set")
+	}
+}
+
+func TestHandleStatsCache(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	// First request
+	req1 := httptest.NewRequest("GET", "/api/stats", nil)
+	w1 := httptest.NewRecorder()
+	server.router.ServeHTTP(w1, req1)
+
+	if w1.Code != http.StatusOK {
+		t.Errorf("First request status = %d", w1.Code)
+	}
+
+	// Second request should hit cache
+	req2 := httptest.NewRequest("GET", "/api/stats", nil)
+	w2 := httptest.NewRecorder()
+	server.router.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Errorf("Second request status = %d", w2.Code)
+	}
+}
+
+func TestHandleBlocks(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/api/blocks", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var response map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+
+	if _, ok := response["blocks"]; !ok {
+		t.Error("Response should contain 'blocks' field")
+	}
+}
+
+func TestHandlePayments(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/api/payments", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var response map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+
+	if _, ok := response["payments"]; !ok {
+		t.Error("Response should contain 'payments' field")
+	}
+}
+
+func TestHandleMinerInvalidAddress(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/api/miners/invalid", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandleMinerNotFound(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	// Use a valid 62-character bech32 address that doesn't exist in the DB
+	req := httptest.NewRequest("GET", "/api/miners/tos1qpzry9x8gf2tvdw0s3jn54khce6mua7lmqqqxw823456789acdefghjklm", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestHandleMinerPaymentsInvalidAddress(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/api/miners/invalid/payments", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandleMinerChartInvalidAddress(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/api/miners/invalid/chart", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandleLuck(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/api/luck", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestHandlePoolHashrateChart(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/api/chart/hashrate", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var response map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+
+	if hours, ok := response["hours"].(float64); !ok || hours != 24 {
+		t.Errorf("Hours = %v, want 24", response["hours"])
+	}
+}
+
+func TestHandlePoolHashrateChartWithParams(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/api/chart/hashrate?hours=48", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var response map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &response)
+	if hours, ok := response["hours"].(float64); !ok || hours != 48 {
+		t.Errorf("Hours = %v, want 48", response["hours"])
+	}
+}
+
+func TestHandlePoolHashrateChartMaxLimit(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/api/chart/hashrate?hours=500", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var response map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &response)
+	if hours, ok := response["hours"].(float64); !ok || hours != 168 {
+		t.Errorf("Hours = %v, want 168 (max)", response["hours"])
+	}
+}
+
+func TestAdminAuthMiddlewareNoAuth(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/admin/stats", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestAdminAuthMiddlewareWrongPassword(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/admin/stats", nil)
+	req.Header.Set("Authorization", "wrongpassword")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+}
+
+func TestAdminAuthMiddlewareCorrectPassword(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/admin/stats", nil)
+	req.Header.Set("Authorization", "testpassword")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestAdminAuthMiddlewareBearerToken(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/admin/stats", nil)
+	req.Header.Set("Authorization", "Bearer testpassword")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestHandleAdminStats(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/admin/stats", nil)
+	req.Header.Set("Authorization", "testpassword")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var response AdminStatsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+}
+
+func TestHandleGetBlacklist(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/admin/blacklist", nil)
+	req.Header.Set("Authorization", "testpassword")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestHandleAddBlacklist(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	body := bytes.NewBufferString(`{"address":"tos1badactor"}`)
+	req := httptest.NewRequest("POST", "/admin/blacklist", body)
+	req.Header.Set("Authorization", "testpassword")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestHandleAddBlacklistInvalidRequest(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	body := bytes.NewBufferString(`invalid json`)
+	req := httptest.NewRequest("POST", "/admin/blacklist", body)
+	req.Header.Set("Authorization", "testpassword")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandleAddBlacklistEmptyAddress(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	body := bytes.NewBufferString(`{"address":""}`)
+	req := httptest.NewRequest("POST", "/admin/blacklist", body)
+	req.Header.Set("Authorization", "testpassword")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandleRemoveBlacklist(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	// First add to blacklist
+	mr.SAdd("pool:blacklist", "tos1badactor")
+
+	req := httptest.NewRequest("DELETE", "/admin/blacklist/tos1badactor", nil)
+	req.Header.Set("Authorization", "testpassword")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestHandleGetWhitelist(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/admin/whitelist", nil)
+	req.Header.Set("Authorization", "testpassword")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestHandleAddWhitelist(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	body := bytes.NewBufferString(`{"ip":"192.168.1.100"}`)
+	req := httptest.NewRequest("POST", "/admin/whitelist", body)
+	req.Header.Set("Authorization", "testpassword")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestHandleAddWhitelistInvalidRequest(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	body := bytes.NewBufferString(`invalid json`)
+	req := httptest.NewRequest("POST", "/admin/whitelist", body)
+	req.Header.Set("Authorization", "testpassword")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandleAddWhitelistEmptyIP(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	body := bytes.NewBufferString(`{"ip":""}`)
+	req := httptest.NewRequest("POST", "/admin/whitelist", body)
+	req.Header.Set("Authorization", "testpassword")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandleRemoveWhitelist(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	// First add to whitelist
+	mr.SAdd("pool:whitelist", "192.168.1.100")
+
+	req := httptest.NewRequest("DELETE", "/admin/whitelist/192.168.1.100", nil)
+	req.Header.Set("Authorization", "testpassword")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestHandlePendingPayments(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/admin/pending-payments", nil)
+	req.Header.Set("Authorization", "testpassword")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestHandleBackup(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/admin/backup", nil)
+	req.Header.Set("Authorization", "testpassword")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	contentDisposition := w.Header().Get("Content-Disposition")
+	if contentDisposition == "" {
+		t.Error("Content-Disposition header should be set")
+	}
+
+	contentType := w.Header().Get("Content-Type")
+	if contentType != "application/json" {
+		t.Errorf("Content-Type = %s, want application/json", contentType)
+	}
+}
+
+func TestHandleUpstreamsNoCallback(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	req := httptest.NewRequest("GET", "/admin/upstreams", nil)
+	req.Header.Set("Authorization", "testpassword")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var response map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &response)
+	if total, ok := response["total"].(float64); !ok || total != 0 {
+		t.Errorf("Total = %v, want 0", response["total"])
+	}
+}
+
+func TestHandleUpstreamsWithCallback(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	server.SetUpstreamStateFunc(func() []UpstreamStatus {
+		return []UpstreamStatus{
+			{Name: "node1", Healthy: true, Height: 12345},
+			{Name: "node2", Healthy: false, Height: 12340},
+		}
+	})
+
+	req := httptest.NewRequest("GET", "/admin/upstreams", nil)
+	req.Header.Set("Authorization", "testpassword")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var response map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &response)
+	if total, ok := response["total"].(float64); !ok || total != 2 {
+		t.Errorf("Total = %v, want 2", response["total"])
+	}
+	if healthy, ok := response["healthy"].(float64); !ok || healthy != 1 {
+		t.Errorf("Healthy = %v, want 1", response["healthy"])
+	}
+	if active, ok := response["active"].(string); !ok || active != "node1" {
+		t.Errorf("Active = %v, want node1", response["active"])
+	}
+}
+
+func TestSetUpstreamStateFunc(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	if server.upstreamStateFunc != nil {
+		t.Error("upstreamStateFunc should be nil initially")
+	}
+
+	fn := func() []UpstreamStatus {
+		return []UpstreamStatus{}
+	}
+	server.SetUpstreamStateFunc(fn)
+
+	if server.upstreamStateFunc == nil {
+		t.Error("upstreamStateFunc should be set")
+	}
+}
+
+func TestServerStartStop(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("Failed to start miniredis: %v", err)
+	}
+	defer mr.Close()
+
+	redis, _ := storage.NewRedisClient(mr.Addr(), "", 0)
+
+	cfg := &config.Config{
+		API: config.APIConfig{
+			Bind:       ":0", // Use random available port
+			StatsCache: 5 * time.Second,
+		},
+		Validation: config.ValidationConfig{
+			HashrateWindow:      600 * time.Second,
+			HashrateLargeWindow: 3600 * time.Second,
+		},
+	}
+
+	server := NewServer(cfg, redis)
+
+	if err := server.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+
+	// Give the server time to start
+	time.Sleep(100 * time.Millisecond)
+
+	if err := server.Stop(); err != nil {
+		t.Errorf("Stop() failed: %v", err)
+	}
+}
+
+func TestServerStopNotStarted(t *testing.T) {
+	server, mr := setupTestServer(t)
+	defer mr.Close()
+
+	// Should not panic when stopping without starting
+	err := server.Stop()
+	if err != nil {
+		t.Errorf("Stop() returned error: %v", err)
 	}
 }
 

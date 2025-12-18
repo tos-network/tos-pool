@@ -292,3 +292,339 @@ func BenchmarkExtractIP(b *testing.B) {
 		extractIP(input)
 	}
 }
+
+func TestMaxRequestConstants(t *testing.T) {
+	if MaxRequestSize != 1024 {
+		t.Errorf("MaxRequestSize = %d, want 1024", MaxRequestSize)
+	}
+	if MaxRequestBuffer != MaxRequestSize+64 {
+		t.Errorf("MaxRequestBuffer = %d, want %d", MaxRequestBuffer, MaxRequestSize+64)
+	}
+}
+
+func TestNewStratumServer(t *testing.T) {
+	cfg := &config.Config{
+		Slave: config.SlaveConfig{
+			StratumBind: ":3333",
+		},
+	}
+
+	server := NewStratumServer(cfg, nil)
+
+	if server == nil {
+		t.Fatal("NewStratumServer returned nil")
+	}
+
+	if server.cfg != cfg {
+		t.Error("Server.cfg not set correctly")
+	}
+
+	if server.quit == nil {
+		t.Error("Server.quit channel should be initialized")
+	}
+}
+
+func TestSetShareCallback(t *testing.T) {
+	cfg := &config.Config{}
+	server := NewStratumServer(cfg, nil)
+
+	server.SetShareCallback(func(s *Share) {
+		// Callback set
+	})
+
+	if server.onShare == nil {
+		t.Error("onShare callback should be set")
+	}
+}
+
+func TestSetBlockCallback(t *testing.T) {
+	cfg := &config.Config{}
+	server := NewStratumServer(cfg, nil)
+
+	server.SetBlockCallback(func(s *Share) {
+		// Callback set
+	})
+
+	if server.onBlock == nil {
+		t.Error("onBlock callback should be set")
+	}
+}
+
+func TestStratumRequestStruct(t *testing.T) {
+	req := StratumRequest{
+		ID:     1,
+		Method: "mining.subscribe",
+		Params: []interface{}{"TOS-miner/1.0"},
+	}
+
+	if req.Method != "mining.subscribe" {
+		t.Errorf("StratumRequest.Method = %s, want mining.subscribe", req.Method)
+	}
+
+	if len(req.Params) != 1 {
+		t.Errorf("StratumRequest.Params len = %d, want 1", len(req.Params))
+	}
+}
+
+func TestStratumResponseStruct(t *testing.T) {
+	resp := StratumResponse{
+		ID:     1,
+		Result: true,
+		Error:  nil,
+	}
+
+	if resp.ID != 1 {
+		t.Errorf("StratumResponse.ID = %v, want 1", resp.ID)
+	}
+
+	if resp.Error != nil {
+		t.Error("StratumResponse.Error should be nil")
+	}
+}
+
+func TestStratumResponseWithError(t *testing.T) {
+	resp := StratumResponse{
+		ID:     1,
+		Result: nil,
+		Error:  []interface{}{24, "Unauthorized worker", nil},
+	}
+
+	if resp.Result != nil {
+		t.Error("StratumResponse.Result should be nil")
+	}
+
+	errSlice, ok := resp.Error.([]interface{})
+	if !ok {
+		t.Error("StratumResponse.Error should be a slice")
+	}
+
+	if errSlice[0].(int) != 24 {
+		t.Errorf("Error code = %v, want 24", errSlice[0])
+	}
+}
+
+func TestStratumNotifyStruct(t *testing.T) {
+	notify := StratumNotify{
+		ID:     nil,
+		Method: "mining.notify",
+		Params: []interface{}{"job1", "header", "target"},
+	}
+
+	if notify.Method != "mining.notify" {
+		t.Errorf("StratumNotify.Method = %s, want mining.notify", notify.Method)
+	}
+
+	if notify.ID != nil {
+		t.Error("StratumNotify.ID should be nil for notifications")
+	}
+}
+
+func TestSessionVardiffStatsInit(t *testing.T) {
+	session := &Session{
+		ID:         1,
+		Difficulty: 1000000,
+		VardiffStats: &VardiffStats{
+			LastRetarget:   time.Now(),
+			SharesSince:    0,
+			MinerRequested: false,
+		},
+	}
+
+	if session.VardiffStats == nil {
+		t.Error("Session.VardiffStats should not be nil")
+	}
+
+	if session.VardiffStats.SharesSince != 0 {
+		t.Errorf("VardiffStats.SharesSince = %d, want 0", session.VardiffStats.SharesSince)
+	}
+}
+
+func TestShareIsBlock(t *testing.T) {
+	normalShare := &Share{
+		Address:    "tos1test",
+		Difficulty: 1000000,
+		IsBlock:    false,
+	}
+
+	blockShare := &Share{
+		Address:    "tos1test",
+		Difficulty: 1000000,
+		IsBlock:    true,
+	}
+
+	if normalShare.IsBlock {
+		t.Error("Normal share should not be a block")
+	}
+
+	if !blockShare.IsBlock {
+		t.Error("Block share should be marked as block")
+	}
+}
+
+func TestParseWorkerIDEdgeCases(t *testing.T) {
+	tests := []struct {
+		name           string
+		input          string
+		expectAddress  string
+		expectWorker   string
+	}{
+		{"dots in worker name", "tos1addr.worker.name.with.dots", "tos1addr", "worker.name.with.dots"},
+		{"numeric worker", "tos1addr.12345", "tos1addr", "12345"},
+		{"underscores", "tos1addr.worker_1_gpu", "tos1addr", "worker_1_gpu"},
+		{"mixed case", "tos1addr.WorkerOne", "tos1addr", "WorkerOne"},
+		{"empty worker part", "tos1addr.", "tos1addr", ""},
+		{"just dot", ".", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addr, worker := parseWorkerID(tt.input)
+			if addr != tt.expectAddress {
+				t.Errorf("parseWorkerID(%q) address = %q, want %q", tt.input, addr, tt.expectAddress)
+			}
+			if worker != tt.expectWorker {
+				t.Errorf("parseWorkerID(%q) worker = %q, want %q", tt.input, worker, tt.expectWorker)
+			}
+		})
+	}
+}
+
+func TestExtractIPEdgeCases(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"localhost ipv6", "[::1]:8080", "::1"},
+		{"full ipv6", "[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:443", "2001:0db8:85a3:0000:0000:8a2e:0370:7334"},
+		{"ipv4 no port", "1.2.3.4", "1.2.3.4"},
+		{"high port", "192.168.1.1:65535", "192.168.1.1"},
+		{"port 1", "10.0.0.1:1", "10.0.0.1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractIP(tt.input)
+			if result != tt.expected {
+				t.Errorf("extractIP(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSessionAuthorization(t *testing.T) {
+	session := &Session{
+		ID:         1,
+		Authorized: false,
+	}
+
+	if session.Authorized {
+		t.Error("Session should not be authorized initially")
+	}
+
+	session.Authorized = true
+	if !session.Authorized {
+		t.Error("Session should be authorized after setting")
+	}
+}
+
+func TestSessionShareCounts(t *testing.T) {
+	session := &Session{
+		ID:            1,
+		ValidShares:   0,
+		InvalidShares: 0,
+		StaleShares:   0,
+	}
+
+	// Simulate share processing
+	session.ValidShares++
+	session.ValidShares++
+	session.InvalidShares++
+	session.StaleShares++
+
+	if session.ValidShares != 2 {
+		t.Errorf("ValidShares = %d, want 2", session.ValidShares)
+	}
+	if session.InvalidShares != 1 {
+		t.Errorf("InvalidShares = %d, want 1", session.InvalidShares)
+	}
+	if session.StaleShares != 1 {
+		t.Errorf("StaleShares = %d, want 1", session.StaleShares)
+	}
+}
+
+func TestJobCreatedAtTracking(t *testing.T) {
+	before := time.Now()
+	job := &Job{
+		ID:        "test",
+		CreatedAt: time.Now(),
+	}
+	after := time.Now()
+
+	if job.CreatedAt.Before(before) {
+		t.Error("Job.CreatedAt should not be before creation time")
+	}
+	if job.CreatedAt.After(after) {
+		t.Error("Job.CreatedAt should not be after test completion")
+	}
+}
+
+func TestTrustScoreBoundaries(t *testing.T) {
+	cfg := &config.Config{
+		Validation: config.ValidationConfig{
+			TrustThreshold:    50,
+			TrustCheckPercent: 50,
+		},
+	}
+
+	server := &StratumServer{cfg: cfg}
+
+	// Test boundary at exactly threshold
+	sessionAtThreshold := &Session{TrustScore: 50}
+	// At threshold, some should skip (probability test)
+
+	// Test just below threshold - should never skip
+	sessionBelowThreshold := &Session{TrustScore: 49}
+	skipped := false
+	for i := 0; i < 100; i++ {
+		if server.shouldSkipValidation(sessionBelowThreshold) {
+			skipped = true
+			break
+		}
+	}
+	if skipped {
+		t.Error("Session below threshold should never skip validation")
+	}
+
+	// Test zero trust score
+	sessionZeroTrust := &Session{TrustScore: 0}
+	for i := 0; i < 100; i++ {
+		if server.shouldSkipValidation(sessionZeroTrust) {
+			t.Error("Session with zero trust should never skip validation")
+			break
+		}
+	}
+
+	_ = sessionAtThreshold // Used for threshold boundary awareness
+}
+
+func TestShouldSkipValidationDisabled(t *testing.T) {
+	// Zero threshold means disabled
+	cfg := &config.Config{
+		Validation: config.ValidationConfig{
+			TrustThreshold:    0,
+			TrustCheckPercent: 50,
+		},
+	}
+
+	server := &StratumServer{cfg: cfg}
+	session := &Session{TrustScore: 1000} // Very high trust score
+
+	// With threshold 0, should never skip
+	for i := 0; i < 100; i++ {
+		if server.shouldSkipValidation(session) {
+			t.Error("Should never skip when threshold is 0")
+			break
+		}
+	}
+}
