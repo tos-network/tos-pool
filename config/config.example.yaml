@@ -72,7 +72,7 @@ payouts:
 # API server
 api:
   enabled: true
-  bind: "0.0.0.0:8080"
+  bind: "0.0.0.0:8088"
   stats_cache: 10s              # Cache stats for 10 seconds
   cors_origins:
     - "*"

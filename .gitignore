@@ -1,11 +1,11 @@
 # Binaries
+/tos-pool
 bin/
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-tos-pool
 
 # Test binary
 *.test
