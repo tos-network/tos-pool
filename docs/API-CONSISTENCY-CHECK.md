@@ -2,6 +2,8 @@
 
 This document provides a detailed comparison of API interface consistency between **tos-pool**, **tosminer**, and **tos daemon** components.
 
+Based on TOS daemon source code analysis (`daemon/src/rpc/rpc.rs`).
+
 ---
 
 ## Table of Contents
@@ -10,8 +12,9 @@ This document provides a detailed comparison of API interface consistency betwee
 2. [Mining Protocol Consistency](#2-mining-protocol-consistency)
 3. [RPC Method Mapping](#3-rpc-method-mapping)
 4. [Data Structure Consistency](#4-data-structure-consistency)
-5. [Issues and Recommendations](#5-issues-and-recommendations)
-6. [Consistency Matrix](#6-consistency-matrix)
+5. [TOS Daemon Complete API Reference](#5-tos-daemon-complete-api-reference)
+6. [Issues and Recommendations](#6-issues-and-recommendations)
+7. [Consistency Matrix](#7-consistency-matrix)
 
 ---
 
@@ -19,7 +22,7 @@ This document provides a detailed comparison of API interface consistency betwee
 
 | Component | Language | Role | Primary Interfaces |
 |-----------|----------|------|-------------------|
-| **tos daemon** | Rust | Blockchain Node | JSON-RPC (81 methods), GetWork WebSocket |
+| **tos daemon** | Rust | Blockchain Node | JSON-RPC (80+ methods), GetWork WebSocket |
 | **tos-pool** | Go | Mining Pool Proxy | REST API, Stratum, WebSocket, Xatum, GetWork |
 | **tosminer** | C++ | Mining Client | HTTP API, Stratum Client |
 
@@ -40,13 +43,13 @@ This document provides a detailed comparison of API interface consistency betwee
 
 | Method | tosminer (Client) | tos-pool (Server) | Consistency |
 |--------|-------------------|-------------------|-------------|
-| `mining.subscribe` | ✅ Sends | ✅ Handles | ✅ Consistent |
-| `mining.authorize` | ✅ Sends | ✅ Handles | ✅ Consistent |
-| `mining.submit` | ✅ Sends | ✅ Handles | ⚠️ Parameter format differs |
-| `mining.notify` | ✅ Receives | ✅ Sends | ⚠️ Parameter format differs |
-| `mining.set_difficulty` | ✅ Receives | ✅ Sends | ✅ Consistent |
-| `mining.ping` | ✅ Sends | ✅ Handles | ✅ Consistent |
-| `mining.extranonce.subscribe` | ✅ Sends | ✅ Handles | ✅ Consistent |
+| `mining.subscribe` | Sends | Handles | Consistent |
+| `mining.authorize` | Sends | Handles | Consistent |
+| `mining.submit` | Sends | Handles | Parameter format differs |
+| `mining.notify` | Receives | Sends | Parameter format differs |
+| `mining.set_difficulty` | Receives | Sends | Consistent |
+| `mining.ping` | Sends | Handles | Consistent |
+| `mining.extranonce.subscribe` | Sends | Handles | Consistent |
 
 #### 2.1.1 `mining.subscribe` Detailed Comparison
 
@@ -71,7 +74,7 @@ This document provides a detailed comparison of API interface consistency betwee
 }
 ```
 
-**Consistency:** ✅ Fully consistent
+**Consistency:** Fully consistent
 
 #### 2.1.2 `mining.authorize` Detailed Comparison
 
@@ -89,7 +92,7 @@ This document provides a detailed comparison of API interface consistency betwee
 - Password: Optional (typically "x")
 - Validation: Address format validation
 
-**Consistency:** ✅ Fully consistent
+**Consistency:** Fully consistent
 
 #### 2.1.3 `mining.submit` Detailed Comparison
 
@@ -106,7 +109,7 @@ This document provides a detailed comparison of API interface consistency betwee
 - Format 1 (4 params): `[worker, job_id, extranonce2, nonce]`
 - Format 2 (5 params): `[worker, job_id, extranonce2, ntime, nonce]`
 
-**Consistency:** ⚠️ Note parameter count difference; tos-pool supports both formats
+**Consistency:** Note parameter count difference; tos-pool supports both formats
 
 #### 2.1.4 `mining.notify` Detailed Comparison
 
@@ -130,51 +133,48 @@ This document provides a detailed comparison of API interface consistency betwee
 [job_id, header_hex, target_hex, height, clean_jobs]
 ```
 
-**Consistency:** ✅ Consistent (TOS simplified format)
-
-**Note:** tosminer also supports standard Stratum format as fallback:
-```
-[job_id, prev_hash, coinbase1, coinbase2, merkle_branches[], version, nbits, ntime, clean_jobs]
-```
+**Consistency:** Consistent (TOS simplified format)
 
 ---
 
-### 2.2 Pool ↔ Daemon RPC Consistency
+### 2.2 Pool to Daemon RPC Consistency
 
 | tos-pool Call | tos daemon Method | Consistency |
 |---------------|-------------------|-------------|
-| `tos_getWork` | `get_block_template` | ⚠️ Different names, needs mapping |
-| `tos_getBlockTemplate` | `get_block_template` | ✅ Semantically consistent |
-| `tos_submitWork` | `submit_block` | ⚠️ Different names, needs mapping |
-| `tos_submitBlock` | `submit_block` | ✅ Semantically consistent |
-| `tos_getBlockByNumber` | `get_block_at_topoheight` | ⚠️ Parameter format differs |
-| `tos_getBlockByHash` | `get_block_by_hash` | ✅ Semantically consistent |
-| `tos_blockNumber` | `get_height` / `get_topoheight` | ⚠️ TOS uses topoheight |
-| `net_peerCount` | `p2p_status` | ⚠️ Response structure differs |
-| `tos_getBalance` | `get_balance` | ✅ Semantically consistent |
-| `tos_getTransactionReceipt` | `get_transaction` | ⚠️ Response structure differs |
-| `tos_sendRawTransaction` | `submit_transaction` | ✅ Semantically consistent |
-| `tos_getTransactionCount` | `get_nonce` | ✅ Semantically consistent |
-| `tos_estimateGas` | ❌ Does not exist | ❌ Missing |
-| `tos_gasPrice` | ❌ Does not exist | ❌ Missing |
-| `tos_syncing` | ❌ Does not exist | ❌ Missing |
+| `tos_getWork` | `get_block_template` | Different names, needs mapping |
+| `tos_getBlockTemplate` | `get_block_template` | Semantically consistent |
+| `tos_submitWork` | `submit_block` | Different names, needs mapping |
+| `tos_submitBlock` | `submit_block` | Semantically consistent |
+| `tos_getBlockByNumber` | `get_block_at_topoheight` | Parameter format differs |
+| `tos_getBlockByHash` | `get_block_by_hash` | Semantically consistent |
+| `tos_blockNumber` | `get_height` / `get_topoheight` | TOS uses topoheight |
+| `net_peerCount` | `p2p_status` | Response structure differs |
+| `tos_getBalance` | `get_balance` | Requires asset parameter |
+| `tos_getTransactionReceipt` | `get_transaction` | Response structure differs |
+| `tos_sendRawTransaction` | `submit_transaction` | Semantically consistent |
+| `tos_getTransactionCount` | `get_nonce` | Semantically consistent |
+| `tos_estimateGas` | N/A | TOS has no gas concept |
+| `tos_gasPrice` | N/A | TOS has no gas concept |
+| `tos_syncing` | N/A | Use `get_info` instead |
 
 ---
 
 ## 3. RPC Method Mapping
 
-### 3.1 tos-pool → tos daemon Method Mapping
+### 3.1 tos-pool to tos daemon Method Mapping
 
 #### 3.1.1 Mining Related
 
 | tos-pool Call | tos daemon Actual Method | Status |
 |---------------|--------------------------|--------|
-| `tos_getWork` | `get_block_template` | ⚠️ Needs adapter layer |
-| `tos_getBlockTemplate` | `get_block_template` | ✅ |
-| `tos_submitWork` | `submit_block` | ⚠️ Needs adapter layer |
-| `tos_submitBlock` | `submit_block` | ✅ |
+| `tos_getWork` | `get_block_template` | Needs adapter layer |
+| `tos_getBlockTemplate` | `get_block_template` | OK |
+| `tos_submitWork` | `submit_block` | Needs adapter layer |
+| `tos_submitBlock` | `submit_block` | OK |
 
-**tos daemon `get_block_template` Request:**
+**tos daemon `get_block_template` (rpc.rs:730)**
+
+Request:
 ```json
 {
   "jsonrpc": "2.0",
@@ -186,109 +186,742 @@ This document provides a detailed comparison of API interface consistency betwee
 }
 ```
 
-**tos daemon `get_block_template` Response:**
+Response (`GetBlockTemplateResult`):
 ```json
 {
-  "template": "hex_string",
-  "algorithm": "V3",
-  "height": 12345,
-  "topoheight": 12345,
-  "difficulty": "Difficulty"
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "template": "hex_encoded_block_header",
+    "algorithm": "tos/v3",
+    "height": 12345,
+    "topoheight": 12345,
+    "difficulty": "1000000"
+  }
 }
 ```
 
-**tos-pool Expected `tos_getWork` Response:**
+**tos daemon `submit_block` (rpc.rs:817)**
+
+Request:
 ```json
-["headerHash", "seedHash", "target", "height"]
+{
+  "jsonrpc": "2.0",
+  "method": "submit_block",
+  "params": {
+    "block_template": "hex_encoded_block_header",
+    "miner_work": "hex_encoded_miner_work"
+  },
+  "id": 1
+}
 ```
 
-**Consistency Issue:** ❌ Completely different response structures, requires adapter layer conversion
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+```
+
+**tos daemon `get_miner_work` (rpc.rs:769)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_miner_work",
+  "params": {
+    "template": "hex_encoded_block_template",
+    "address": "tos1..."
+  },
+  "id": 1
+}
+```
+
+Response (`GetMinerWorkResult`):
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "algorithm": "tos/v3",
+    "miner_work": "hex_encoded_miner_job",
+    "height": 12345,
+    "difficulty": "1000000",
+    "topoheight": 12345
+  }
+}
+```
 
 #### 3.1.2 Block Query Related
 
 | tos-pool Call | tos daemon Method | Parameter Mapping |
 |---------------|-------------------|-------------------|
-| `tos_getBlockByNumber(0x...)` | `get_block_at_topoheight` | hex → topoheight |
-| `tos_getBlockByHash(hash)` | `get_block_by_hash` | ✅ Direct mapping |
+| `tos_getBlockByNumber(0x...)` | `get_block_at_topoheight` | hex to topoheight |
+| `tos_getBlockByHash(hash)` | `get_block_by_hash` | Direct mapping |
 | `tos_blockNumber` | `get_topoheight` | Return format hex |
 
-**tos daemon `get_block_by_hash` Response Structure:**
+**tos daemon `get_block_at_topoheight` (rpc.rs:692)**
+
+Request:
 ```json
 {
-  "hash": "Hash",
-  "topoheight": 12345,
-  "block_type": "Normal",
-  "difficulty": "Difficulty",
-  "supply": 12345,
-  "reward": 12345,
-  "miner": "Address",
-  "nonce": "u64",
-  "extra_nonce": "Hash",
-  "timestamp": 1234567890,
-  "height": 12345,
-  "tips": ["Hash"],
-  "txs_hashes": ["Hash"],
-  "version": 1
-}
-```
-
-**tos-pool Expected `BlockInfo` Structure:**
-```go
-type BlockInfo struct {
-    Hash             string
-    ParentHash       string
-    Number           uint64
-    Timestamp        uint64
-    Difficulty       uint64
-    TotalDifficulty  string
-    Nonce            string
-    Miner            string
-    Reward           uint64
-    Size             uint64
-    GasUsed          uint64
-    GasLimit         uint64
-    TransactionCount int
-    TxFees           uint64
-}
-```
-
-**Consistency Issues:** ⚠️ Significant field differences
-- TOS uses `topoheight` instead of `number`
-- TOS uses `tips[]` (DAG) instead of single `parentHash`
-- TOS has no `gasUsed`, `gasLimit` fields
-
-#### 3.1.3 Account/Transaction Related
-
-| tos-pool Call | tos daemon Method | Consistency |
-|---------------|-------------------|-------------|
-| `tos_getBalance(addr, "latest")` | `get_balance(addr, asset)` | ⚠️ asset parameter required |
-| `tos_getTransactionCount(addr)` | `get_nonce(addr)` | ✅ Semantically consistent |
-| `tos_sendRawTransaction(tx)` | `submit_transaction(data)` | ✅ |
-| `tos_getTransactionReceipt(hash)` | `get_transaction(hash)` | ⚠️ Structure differs |
-
-**tos daemon `get_balance` Request:**
-```json
-{
-  "method": "get_balance",
+  "jsonrpc": "2.0",
+  "method": "get_block_at_topoheight",
   "params": {
-    "address": "tos1...",
-    "asset": "0000000000000000000000000000000000000000000000000000000000000000"
+    "topoheight": 12345,
+    "include_txs": false
+  },
+  "id": 1
+}
+```
+
+Response (`RPCBlockResponse`):
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "hash": "block_hash_hex",
+    "topoheight": 12345,
+    "block_type": "Normal",
+    "difficulty": "1000000",
+    "supply": 100000000000000,
+    "reward": 100000000,
+    "miner_reward": 90000000,
+    "dev_reward": 10000000,
+    "cumulative_difficulty": "12345000000",
+    "total_fees": 0,
+    "total_size_in_bytes": 1024,
+    "version": 1,
+    "tips": ["parent_hash_1", "parent_hash_2"],
+    "timestamp": 1734567890000,
+    "height": 12345,
+    "nonce": 123456789,
+    "extra_nonce": "0000000000000000000000000000000000000000000000000000000000000000",
+    "miner": "tos1...",
+    "txs_hashes": ["tx_hash_1", "tx_hash_2"],
+    "transactions": []
   }
 }
 ```
 
-**Consistency Issue:** ⚠️ TOS requires asset hash specification; native token uses all-zero hash
+**Key differences from Ethereum-style:**
+- `topoheight` instead of `number` (TOS uses DAG)
+- `tips[]` instead of single `parentHash` (DAG can have multiple parents)
+- `block_type`: "Sync", "Side", "Orphaned", "Normal"
+- `miner_reward` and `dev_reward` separate from total `reward`
+- `timestamp` in milliseconds
+- No `gasUsed`, `gasLimit` fields (TOS has no gas concept)
 
----
+**tos daemon `get_block_by_hash` (rpc.rs:706)**
 
-### 3.2 tosminer → tos-pool Method Mapping
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_block_by_hash",
+  "params": {
+    "hash": "block_hash_hex",
+    "include_txs": false
+  },
+  "id": 1
+}
+```
 
-| tosminer Method | tos-pool Handler | Consistency |
-|-----------------|------------------|-------------|
-| `mining.subscribe` | `handleSubscribe()` | ✅ |
-| `mining.authorize` | `handleAuthorize()` | ✅ |
-| `mining.submit` | `handleSubmit()` | ✅ |
-| `eth_submitLogin` | `handleAuthorize()` | ✅ (alias) |
+Response: Same as `get_block_at_topoheight`
+
+**tos daemon `get_top_block` (rpc.rs:716)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_top_block",
+  "params": {
+    "include_txs": false
+  },
+  "id": 1
+}
+```
+
+Response: Same as `get_block_at_topoheight`
+
+#### 3.1.3 Height/TopoHeight Methods
+
+**tos daemon `get_height` (rpc.rs:632)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_height",
+  "id": 1
+}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": 12345
+}
+```
+
+**tos daemon `get_topoheight` (rpc.rs:638)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_topoheight",
+  "id": 1
+}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": 12345
+}
+```
+
+**tos daemon `get_stable_height` (rpc.rs:663)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_stable_height",
+  "id": 1
+}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": 12337
+}
+```
+
+**tos daemon `get_stable_topoheight` (rpc.rs:672)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_stable_topoheight",
+  "id": 1
+}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": 12337
+}
+```
+
+#### 3.1.4 Account/Balance Methods
+
+**tos daemon `get_balance` (rpc.rs:841)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_balance",
+  "params": {
+    "address": "tos1...",
+    "asset": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "id": 1
+}
+```
+
+Response (`GetBalanceResult`):
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "balance": 100000000000000,
+    "topoheight": 12345
+  }
+}
+```
+
+**Note:** The `asset` parameter is required. Use 64 zeros for native TOS token.
+
+**tos daemon `get_balance_at_topoheight` (rpc.rs:1020)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_balance_at_topoheight",
+  "params": {
+    "address": "tos1...",
+    "asset": "0000000000000000000000000000000000000000000000000000000000000000",
+    "topoheight": 12345
+  },
+  "id": 1
+}
+```
+
+Response (`VersionedBalance`):
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "previous_topoheight": 12300,
+    "output_balance": null,
+    "final_balance": 100000000000000,
+    "balance_type": "input"
+  }
+}
+```
+
+**tos daemon `has_balance` (rpc.rs:919)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "has_balance",
+  "params": {
+    "address": "tos1...",
+    "asset": "0000000000000000000000000000000000000000000000000000000000000000",
+    "topoheight": 12345
+  },
+  "id": 1
+}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "exist": true
+  }
+}
+```
+
+**tos daemon `get_nonce` (rpc.rs:1075)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_nonce",
+  "params": {
+    "address": "tos1..."
+  },
+  "id": 1
+}
+```
+
+Response (`GetNonceResult`):
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "topoheight": 12345,
+    "nonce": 0,
+    "previous_topoheight": null
+  }
+}
+```
+
+**tos daemon `get_nonce_at_topoheight` (rpc.rs:1096)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_nonce_at_topoheight",
+  "params": {
+    "address": "tos1...",
+    "topoheight": 12345
+  },
+  "id": 1
+}
+```
+
+Response (`VersionedNonce`):
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "nonce": 0,
+    "previous_topoheight": null
+  }
+}
+```
+
+**tos daemon `has_nonce` (rpc.rs:1050)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "has_nonce",
+  "params": {
+    "address": "tos1...",
+    "topoheight": 12345
+  },
+  "id": 1
+}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "exist": true
+  }
+}
+```
+
+#### 3.1.5 Transaction Methods
+
+**tos daemon `submit_transaction` (rpc.rs:1255)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "submit_transaction",
+  "params": {
+    "data": "hex_encoded_transaction"
+  },
+  "id": 1
+}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+```
+
+**tos daemon `get_transaction` (rpc.rs:1277)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_transaction",
+  "params": {
+    "hash": "tx_hash_hex"
+  },
+  "id": 1
+}
+```
+
+Response (`TransactionResponse`):
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "hash": "tx_hash_hex",
+    "blocks": ["block_hash_1"],
+    "executed_in_block": "block_hash_1",
+    "in_mempool": false,
+    "first_seen": 1734567890,
+    "version": 0,
+    "source": "tos1...",
+    "data": {
+      "Transfer": [{
+        "asset": "0000000000000000000000000000000000000000000000000000000000000000",
+        "amount": 1000000000,
+        "destination": "tos1..."
+      }]
+    },
+    "fee": 1000,
+    "nonce": 0,
+    "reference": {
+      "topoheight": 12344,
+      "hash": "reference_block_hash"
+    },
+    "multisig": null,
+    "signature": "signature_hex",
+    "size": 256
+  }
+}
+```
+
+**tos daemon `get_transactions` (rpc.rs:1623)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_transactions",
+  "params": {
+    "tx_hashes": ["tx_hash_1", "tx_hash_2"]
+  },
+  "id": 1
+}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    { /* TransactionResponse */ },
+    { /* TransactionResponse */ }
+  ]
+}
+```
+
+**tos daemon `get_transaction_executor` (rpc.rs:1289)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_transaction_executor",
+  "params": {
+    "hash": "tx_hash_hex"
+  },
+  "id": 1
+}
+```
+
+Response (`GetTransactionExecutorResult`):
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "block_topoheight": 12345,
+    "block_timestamp": 1734567890000,
+    "block_hash": "block_hash_hex"
+  }
+}
+```
+
+**tos daemon `get_mempool` (rpc.rs:1365)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_mempool",
+  "params": {
+    "maximum": 100,
+    "skip": 0
+  },
+  "id": 1
+}
+```
+
+Response (`GetMempoolResult`):
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "transactions": [],
+    "total": 0
+  }
+}
+```
+
+#### 3.1.6 Network Methods
+
+**tos daemon `p2p_status` (rpc.rs:1310)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "p2p_status",
+  "id": 1
+}
+```
+
+Response (`P2pStatusResult`):
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "peer_count": 10,
+    "max_peers": 32,
+    "tag": null,
+    "our_topoheight": 12345,
+    "best_topoheight": 12345,
+    "median_topoheight": 12345,
+    "peer_id": 1234567890
+  }
+}
+```
+
+**tos daemon `get_info` (rpc.rs:948)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_info",
+  "id": 1
+}
+```
+
+Response (`GetInfoResult`):
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "height": 12345,
+    "topoheight": 12345,
+    "stableheight": 12337,
+    "stable_topoheight": 12337,
+    "pruned_topoheight": null,
+    "top_block_hash": "top_block_hash_hex",
+    "circulating_supply": 100000000000000,
+    "burned_supply": 0,
+    "emitted_supply": 100000000000000,
+    "maximum_supply": 1000000000000000,
+    "difficulty": "1000000",
+    "block_time_target": 15000,
+    "average_block_time": 15000,
+    "block_reward": 100000000,
+    "dev_reward": 10000000,
+    "miner_reward": 90000000,
+    "mempool_size": 0,
+    "version": "1.0.0",
+    "network": "mainnet",
+    "block_version": 1
+  }
+}
+```
+
+**tos daemon `get_version` (rpc.rs:627)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_version",
+  "id": 1
+}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": "1.0.0"
+}
+```
+
+**tos daemon `get_difficulty`**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_difficulty",
+  "id": 1
+}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": "1000000"
+}
+```
+
+**tos daemon `get_tips`**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_tips",
+  "id": 1
+}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": ["tip_hash_1", "tip_hash_2"]
+}
+```
+
+**tos daemon `get_peers` (rpc.rs:1339)**
+
+Request:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "get_peers",
+  "id": 1
+}
+```
+
+Response (`GetPeersResponse`):
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "peers": [
+      {
+        "id": 1234567890,
+        "addr": "192.168.1.1:8080",
+        "local_port": 8080,
+        "tag": null,
+        "version": "1.0.0",
+        "top_block_hash": "hash",
+        "topoheight": 12345,
+        "height": 12345,
+        "last_ping": 1734567890,
+        "pruned_topoheight": null,
+        "cumulative_difficulty": "12345000000",
+        "connected_on": 1734567000,
+        "bytes_sent": 1024,
+        "bytes_recv": 2048
+      }
+    ],
+    "total_peers": 10,
+    "hidden_peers": 0
+  }
+}
+```
 
 ---
 
@@ -323,13 +956,13 @@ type GetworkJob struct {
 }
 ```
 
-#### tos daemon `BlockTemplate`:
+#### tos daemon `GetBlockTemplateResult`:
 ```rust
 struct GetBlockTemplateResult {
-    template: String,      // hex encoded block header
-    algorithm: AlgorithmType,
+    template: String,           // hex encoded block header
+    algorithm: Algorithm,       // "tos/v1", "tos/v2", "tos/v3" (currently v3)
     height: u64,
-    topoheight: u64,
+    topoheight: TopoHeight,
     difficulty: Difficulty,
 }
 ```
@@ -338,12 +971,12 @@ struct GetBlockTemplateResult {
 
 | Field | tosminer | tos-pool | tos daemon | Consistency |
 |-------|----------|----------|------------|-------------|
-| Job ID | `jobId` | `JobID` | N/A (pool generated) | ✅ |
-| Header | `header[112]` | `HeaderHash` | `template` | ⚠️ Different formats |
-| Target | `target` | `Target` | `difficulty` | ⚠️ Needs conversion |
-| Height | `height` | `Height` | `height` | ✅ |
-| ExtraNonce1 | `extraNonce1` | N/A | `extra_nonce` | ⚠️ |
-| ExtraNonce2Size | `extraNonce2Size` | N/A | N/A | ⚠️ |
+| Job ID | `jobId` | `JobID` | N/A (pool generated) | OK |
+| Header | `header[112]` | `HeaderHash` | `template` | Different formats |
+| Target | `target` | `Target` | `difficulty` | Needs conversion |
+| Height | `height` | `Height` | `height` | OK |
+| ExtraNonce1 | `extraNonce1` | N/A | `extra_nonce` | Mapping needed |
+| ExtraNonce2Size | `extraNonce2Size` | N/A | N/A | Pool managed |
 
 ### 4.2 Share Submission Structure Comparison
 
@@ -384,39 +1017,104 @@ type Share struct {
 ```
 
 **Consistency Issues:**
-- tosminer → tos-pool: ✅ Consistent
-- tos-pool → tos daemon: ⚠️ Requires block_template reconstruction
+- tosminer to tos-pool: Consistent
+- tos-pool to tos daemon: Requires block_template reconstruction
 
 ---
 
-## 5. Issues and Recommendations
+## 5. TOS Daemon Complete API Reference
 
-### 5.1 Identified Consistency Issues
+### 5.1 Mining Methods
 
-#### 5.1.1 Critical Issues (Requires Adapter Layer)
+| Method | Description |
+|--------|-------------|
+| `get_block_template` | Get block template for mining |
+| `submit_block` | Submit solved block |
+| `get_miner_work` | Get miner work from template |
+
+### 5.2 Block Query Methods
+
+| Method | Description |
+|--------|-------------|
+| `get_height` | Get current blockchain height |
+| `get_topoheight` | Get current topological height |
+| `get_stable_height` | Get stable (finalized) height |
+| `get_stable_topoheight` | Get stable topological height |
+| `get_block_at_topoheight` | Get block at specific topoheight |
+| `get_block_by_hash` | Get block by hash |
+| `get_top_block` | Get top/best block |
+| `get_blocks_at_height` | Get blocks at height (DAG) |
+| `get_tips` | Get current DAG tips |
+| `get_dag_order` | Get blocks in topological order |
+| `get_difficulty` | Get current network difficulty |
+
+### 5.3 Account Methods
+
+| Method | Description |
+|--------|-------------|
+| `get_balance` | Get account balance (requires asset) |
+| `get_balance_at_topoheight` | Get balance at specific topoheight |
+| `has_balance` | Check if account has balance |
+| `get_nonce` | Get account nonce |
+| `get_nonce_at_topoheight` | Get nonce at specific topoheight |
+| `has_nonce` | Check if account has nonce |
+
+### 5.4 Transaction Methods
+
+| Method | Description |
+|--------|-------------|
+| `submit_transaction` | Submit transaction to mempool |
+| `get_transaction` | Get transaction by hash |
+| `get_transactions` | Get multiple transactions |
+| `get_transaction_executor` | Get block where tx was executed |
+| `get_mempool` | Get mempool transactions |
+
+### 5.5 Network Methods
+
+| Method | Description |
+|--------|-------------|
+| `p2p_status` | Get P2P network status |
+| `get_info` | Get complete daemon info |
+| `get_version` | Get daemon version |
+| `get_peers` | Get connected peers |
+
+### 5.6 Asset Methods
+
+| Method | Description |
+|--------|-------------|
+| `get_asset` | Get asset info (decimals, etc.) |
+
+---
+
+## 6. Issues and Recommendations
+
+### 6.1 Identified Consistency Issues
+
+#### 6.1.1 Critical Issues (Requires Adapter Layer)
 
 | Issue | Description | Impact | Recommendation |
 |-------|-------------|--------|----------------|
 | **RPC Method Name Mismatch** | tos-pool uses `tos_getWork`, daemon uses `get_block_template` | Cannot communicate directly | Add adapter layer in tos-pool |
 | **Response Structure Difference** | daemon returns Rust struct, pool expects Ethereum style | Parsing failure | Implement response converter |
-| **Missing Methods** | `tos_estimateGas`, `tos_gasPrice`, `tos_syncing` | Some features unavailable | daemon adds compatible methods or pool removes dependency |
+| **Missing Methods** | `tos_estimateGas`, `tos_gasPrice`, `tos_syncing` | Some features unavailable | Remove dependency (TOS has no gas) |
 
-#### 5.1.2 Medium Issues (Needs Attention)
+#### 6.1.2 Medium Issues (Needs Attention)
 
 | Issue | Description | Recommendation |
 |-------|-------------|----------------|
-| **Height vs TopoHeight** | TOS uses DAG with both height and topoheight concepts | Use topoheight consistently |
-| **Asset Parameter** | `get_balance` must specify asset | pool defaults to native token hash |
-| **Tips vs ParentHash** | DAG structure has multiple parent blocks | Use tips[0] as primary parent |
+| **Height vs TopoHeight** | TOS uses DAG with both concepts | Use topoheight consistently |
+| **Asset Parameter** | `get_balance` requires asset | Pool defaults to native token (64 zeros) |
+| **Tips vs ParentHash** | DAG has multiple parents | Use tips[0] as primary parent |
 
-#### 5.1.3 Minor Issues (Can Ignore)
+#### 6.1.3 Minor Issues (Can Ignore)
 
 | Issue | Description |
 |-------|-------------|
-| hex prefix | Ethereum style uses "0x" prefix, TOS may not |
-| Case sensitivity | Method name case differences (camelCase vs snake_case) |
+| hex prefix | Ethereum uses "0x" prefix, TOS does not |
+| Case sensitivity | camelCase vs snake_case |
+| Timestamp format | TOS uses milliseconds |
 
-### 5.2 Recommended Solutions
+### 6.2 Recommended Solutions
 
 #### Solution A: Add Adapter Layer in tos-pool
 
@@ -461,85 +1159,86 @@ async fn tos_get_work(&self) -> Result<[String; 4], Error> {
 }
 ```
 
-### 5.3 Priority Ranking
+### 6.3 Priority Ranking
 
 | Priority | Issue | Action |
 |----------|-------|--------|
-| **P0 - Critical** | RPC method name mismatch | Implement adapter layer |
-| **P0 - Critical** | Response structure difference | Implement response converter |
-| **P1 - High** | Missing RPC methods | Evaluate if necessary |
-| **P2 - Medium** | DAG related fields | Documentation |
-| **P3 - Low** | Format differences (hex, case) | Gradual fix |
+| **P0** | RPC method name mismatch | Implement adapter layer |
+| **P0** | Response structure difference | Implement response converter |
+| **P1** | Missing RPC methods | Evaluate if necessary |
+| **P2** | DAG related fields | Documentation |
+| **P3** | Format differences (hex, case) | Gradual fix |
 
 ---
 
-## 6. Consistency Matrix
+## 7. Consistency Matrix
 
-### 6.1 Stratum Protocol Consistency (tosminer ↔ tos-pool)
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| mining.subscribe | ✅ Fully consistent | |
-| mining.authorize | ✅ Fully consistent | |
-| mining.submit | ✅ Compatible | Supports 4/5 parameter formats |
-| mining.notify | ✅ Compatible | TOS simplified format + standard format fallback |
-| mining.set_difficulty | ✅ Fully consistent | |
-| mining.ping | ✅ Fully consistent | |
-| Connection management | ✅ Consistent | TLS support, reconnection mechanism |
-
-**Overall Assessment:** ✅ **Highly Consistent** (95%+)
-
-### 6.2 RPC Protocol Consistency (tos-pool ↔ tos daemon)
+### 7.1 Stratum Protocol Consistency (tosminer to tos-pool)
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Get work | ⚠️ Needs adaptation | Method name and response structure differ |
-| Submit block | ⚠️ Needs adaptation | Parameter structure differs |
-| Get block info | ⚠️ Needs adaptation | DAG characteristic differences |
-| Get balance | ⚠️ Needs adaptation | Requires asset parameter |
-| Get nonce | ✅ Semantically consistent | |
-| Submit transaction | ✅ Semantically consistent | |
-| Gas related | ❌ Not supported | TOS has no Gas concept |
-| Sync status | ❌ Not supported | Needs to be added |
+| mining.subscribe | Fully consistent | |
+| mining.authorize | Fully consistent | |
+| mining.submit | Compatible | Supports 4/5 parameter formats |
+| mining.notify | Compatible | TOS simplified format |
+| mining.set_difficulty | Fully consistent | |
+| mining.ping | Fully consistent | |
+| Connection management | Consistent | TLS support, reconnection |
 
-**Overall Assessment:** ⚠️ **Requires Adapter Layer** (60%)
+**Overall Assessment:** **Highly Consistent** (95%+)
 
-### 6.3 Data Structure Consistency
+### 7.2 RPC Protocol Consistency (tos-pool to tos daemon)
 
-| Structure | tosminer ↔ tos-pool | tos-pool ↔ tos daemon |
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Get work | Needs adaptation | Method name and response differ |
+| Submit block | Needs adaptation | Parameter structure differs |
+| Get block info | Needs adaptation | DAG characteristics |
+| Get balance | Needs adaptation | Requires asset parameter |
+| Get nonce | Semantically consistent | |
+| Submit transaction | Semantically consistent | |
+| Gas related | Not supported | TOS has no Gas concept |
+| Sync status | Use get_info | |
+
+**Overall Assessment:** **Requires Adapter Layer** (60%)
+
+### 7.3 Data Structure Consistency
+
+| Structure | tosminer to tos-pool | tos-pool to tos daemon |
 |-----------|---------------------|----------------------|
-| WorkPackage | ✅ Consistent | ⚠️ Needs conversion |
-| Share | ✅ Consistent | N/A |
-| Block | N/A | ⚠️ DAG differences |
-| Transaction | N/A | ⚠️ Field differences |
+| WorkPackage | Consistent | Needs conversion |
+| Share | Consistent | N/A |
+| Block | N/A | DAG differences |
+| Transaction | N/A | Field differences |
 
 ---
 
-## 7. Conclusion
+## 8. Conclusion
 
-### 7.1 Overall Consistency Assessment
+### 8.1 Overall Consistency Assessment
 
 | Communication Link | Consistency Score | Status |
 |--------------------|-------------------|--------|
-| tosminer ↔ tos-pool | **95%** | ✅ Production Ready |
-| tos-pool ↔ tos daemon | **60%** | ⚠️ Requires Adapter Layer |
+| tosminer to tos-pool | **95%** | Production Ready |
+| tos-pool to tos daemon | **60%** | Requires Adapter Layer |
 
-### 7.2 Next Steps
+### 8.2 Key Takeaways
 
-1. **Immediate Action**: Implement TOS daemon adapter layer in tos-pool's `internal/rpc/` directory
-2. **Short-term Goal**: Improve TOS simplified format support for Stratum protocol
-3. **Medium-term Goal**: Evaluate whether to add compatible API in daemon
-4. **Long-term Goal**: Unify data structure definitions across all three components; consider using shared protobuf/flatbuffers definitions
+1. **TOS is not Ethereum**: TOS uses DAG structure with `topoheight`, no gas concept
+2. **Native asset hash**: `0000000000000000000000000000000000000000000000000000000000000000`
+3. **POW Algorithm**: `tos/v3` (versions: `tos/v1`, `tos/v2`, `tos/v3` - currently all use v3)
+4. **Timestamps**: Milliseconds (not seconds)
+5. **JSON-RPC params**: Object style `{}`, not array style `[]`
 
-### 7.3 Risk Assessment
+### 8.3 Next Steps
 
-| Risk | Impact | Mitigation |
-|------|--------|------------|
-| Adapter layer performance overhead | Medium | Implement efficient data conversion, use caching |
-| API change compatibility | High | Version APIs, maintain backward compatibility |
-| DAG characteristic misunderstanding | Medium | Thorough testing, especially fork scenarios |
+1. **Immediate**: Implement TOS daemon adapter layer in `internal/rpc/`
+2. **Short-term**: Update Stratum protocol for TOS format
+3. **Medium-term**: Evaluate compatible API in daemon
+4. **Long-term**: Shared protobuf definitions
 
 ---
 
-*Document generated: 2025-12-18*
+*Document updated: 2025-12-18*
+*Based on: TOS daemon source code (daemon/src/rpc/rpc.rs)*
 *Applicable versions: tos-pool v1.0, tosminer v1.0, tos daemon (latest)*
