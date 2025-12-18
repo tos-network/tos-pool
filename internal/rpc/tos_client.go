@@ -686,7 +686,7 @@ func (c *TOSClient) SearchBlockByHash(ctx context.Context, targetHash string, ce
 	}
 
 	// Fall back to range search
-	// Note: Daemon returns hashes without 0x prefix, but pool stores with 0x prefix
+	// Note: hashesEqual handles both prefixed and non-prefixed hashes for backward compatibility
 	for offset := 0; offset <= searchRange; offset++ {
 		if offset >= 0 {
 			height := centerHeight + uint64(offset)

@@ -452,10 +452,10 @@ func (m *Master) processShare(share *ShareSubmission) *ShareResult {
 		}
 
 		if success {
-			// Store block
+			// Store block - use no 0x prefix to match daemon format
 			block := &storage.Block{
 				Height:     job.Height,
-				Hash:       util.BytesToHex(hash),
+				Hash:       util.BytesToHexNoPre(hash),
 				Nonce:      share.Nonce,
 				Difficulty: job.Difficulty,
 				Finder:     share.Address,

@@ -151,7 +151,7 @@ function generateMockBlocks() {
   for (let i = 0; i < 20; i++) {
     blocks.push({
       height: 500000 - i,
-      hash: '0x' + Array(64).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join(''),
+      hash: Array(64).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join(''),
       finder: 'tos1' + Array(58).fill(0).map(() => '023456789acdefghjklmnpqrstuvwxyz'[Math.floor(Math.random() * 32)]).join(''),
       reward: 200000000,
       timestamp: now - i * 1800,
@@ -168,7 +168,7 @@ function generateMockPayments() {
 
   for (let i = 0; i < 20; i++) {
     payments.push({
-      tx_hash: '0x' + Array(64).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join(''),
+      tx_hash: Array(64).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join(''),
       address: 'tos1' + Array(58).fill(0).map(() => '023456789acdefghjklmnpqrstuvwxyz'[Math.floor(Math.random() * 32)]).join(''),
       amount: 10000000 + Math.floor(Math.random() * 90000000),
       timestamp: now - i * 3600,
