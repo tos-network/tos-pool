@@ -369,17 +369,24 @@ func (c *TOSClient) SubmitBlock(ctx context.Context, blockTemplate string, miner
 		params["miner_work"] = minerWork
 	}
 
+	util.Debugf("SubmitBlock: template=%d bytes, minerWork=%d bytes", len(blockTemplate), len(minerWork))
+
 	result, err := c.call(ctx, "submit_block", params)
 	if err != nil {
+		util.Errorf("SubmitBlock RPC error: %v", err)
 		return false, err
 	}
+
+	util.Debugf("SubmitBlock response: %s", string(result))
 
 	var success bool
 	if err := json.Unmarshal(result, &success); err != nil {
 		// Some implementations return the block hash on success
+		util.Debugf("SubmitBlock: unmarshal bool failed, checking non-null: result=%s", string(result))
 		return result != nil && string(result) != "null", nil
 	}
 
+	util.Debugf("SubmitBlock: success=%v", success)
 	return success, nil
 }
 
@@ -433,8 +440,14 @@ func (c *TOSClient) GetBlockByNumber(ctx context.Context, number uint64) (*Block
 
 // GetBlockByHash returns block by hash using get_block_by_hash
 func (c *TOSClient) GetBlockByHash(ctx context.Context, hash string) (*BlockInfo, error) {
+	// Strip 0x prefix if present - TOS daemon doesn't accept it
+	cleanHash := hash
+	if len(hash) > 2 && hash[:2] == "0x" {
+		cleanHash = hash[2:]
+	}
+
 	params := map[string]interface{}{
-		"hash": hash,
+		"hash": cleanHash,
 	}
 
 	result, err := c.call(ctx, "get_block_by_hash", params)
@@ -651,6 +664,20 @@ func (c *TOSClient) GetBlockTxFees(ctx context.Context, blockNumber uint64) (uin
 
 // SearchBlockByHash searches for a block hash in a range of heights
 // Used for deep orphan detection - searches ±searchRange blocks
+// normalizeHash strips 0x prefix and lowercases for comparison
+func normalizeHash(hash string) string {
+	h := strings.ToLower(hash)
+	if len(h) > 2 && h[:2] == "0x" {
+		return h[2:]
+	}
+	return h
+}
+
+// hashesEqual compares two hashes ignoring 0x prefix and case
+func hashesEqual(a, b string) bool {
+	return normalizeHash(a) == normalizeHash(b)
+}
+
 func (c *TOSClient) SearchBlockByHash(ctx context.Context, targetHash string, centerHeight uint64, searchRange int) (*BlockInfo, error) {
 	// First try direct hash lookup
 	block, err := c.GetBlockByHash(ctx, targetHash)
@@ -659,11 +686,12 @@ func (c *TOSClient) SearchBlockByHash(ctx context.Context, targetHash string, ce
 	}
 
 	// Fall back to range search
+	// Note: Daemon returns hashes without 0x prefix, but pool stores with 0x prefix
 	for offset := 0; offset <= searchRange; offset++ {
 		if offset >= 0 {
 			height := centerHeight + uint64(offset)
 			block, err := c.GetBlockByNumber(ctx, height)
-			if err == nil && block != nil && block.Hash == targetHash {
+			if err == nil && block != nil && hashesEqual(block.Hash, targetHash) {
 				return block, nil
 			}
 		}
@@ -671,7 +699,7 @@ func (c *TOSClient) SearchBlockByHash(ctx context.Context, targetHash string, ce
 		if offset > 0 && centerHeight >= uint64(offset) {
 			height := centerHeight - uint64(offset)
 			block, err := c.GetBlockByNumber(ctx, height)
-			if err == nil && block != nil && block.Hash == targetHash {
+			if err == nil && block != nil && hashesEqual(block.Hash, targetHash) {
 				return block, nil
 			}
 		}

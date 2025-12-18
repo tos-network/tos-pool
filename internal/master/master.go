@@ -447,7 +447,11 @@ func (m *Master) processShare(share *ShareSubmission) *ShareResult {
 			util.BytesToHexNoPre(hash))                // unused mixDigest
 		if err != nil {
 			util.Errorf("Block submission failed: %v", err)
-		} else if success {
+		} else if !success {
+			util.Warnf("Block submission rejected by daemon (height: %d)", job.Height)
+		}
+
+		if success {
 			// Store block
 			block := &storage.Block{
 				Height:     job.Height,
