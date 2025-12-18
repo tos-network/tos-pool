@@ -217,8 +217,8 @@ func main() {
 						stratumJob := &slave.Job{
 							ID:         job.ID,
 							Height:     job.Height,
-							HeaderHash: util.BytesToHex(job.HeaderHash),
-							Target:     util.BytesToHex(job.Target),
+							HeaderHash: util.BytesToHexNoPre(job.HeaderHash), // No 0x prefix for Stratum
+							Target:     util.BytesToHexNoPre(job.Target),     // No 0x prefix for Stratum
 							Difficulty: job.Difficulty,
 							Timestamp:  job.Timestamp,
 							CleanJobs:  true,

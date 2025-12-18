@@ -119,8 +119,8 @@ func TestShareStruct(t *testing.T) {
 		Address:        "tos1testaddress",
 		Worker:         "worker1",
 		JobID:          "job456",
-		Nonce:          "0xabcdef1234567890",
-		Hash:           "0x1234567890abcdef",
+		Nonce:          "abcdef1234567890", // No 0x prefix for Stratum
+		Hash:           "1234567890abcdef", // No 0x prefix for Stratum
 		Difficulty:     1000000,
 		Height:         12345,
 		Timestamp:      time.Now().Unix(),
@@ -162,9 +162,9 @@ func TestJobStruct(t *testing.T) {
 	job := &Job{
 		ID:         "job123",
 		Height:     12345,
-		HeaderHash: "0xabcdef",
-		ParentHash: "0x123456",
-		Target:     "0x00001234",
+		HeaderHash: "abcdef1234567890",        // No 0x prefix for Stratum
+		ParentHash: "123456abcdef7890",        // No 0x prefix for Stratum
+		Target:     "00001234567890abcdef",    // No 0x prefix for Stratum
 		Difficulty: 1000000,
 		Timestamp:  12345678,
 		CleanJobs:  true,

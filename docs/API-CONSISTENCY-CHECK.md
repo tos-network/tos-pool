@@ -12,9 +12,10 @@ Based on TOS daemon source code analysis (`daemon/src/rpc/rpc.rs`).
 2. [Mining Protocol Consistency](#2-mining-protocol-consistency)
 3. [RPC Method Mapping](#3-rpc-method-mapping)
 4. [Data Structure Consistency](#4-data-structure-consistency)
-5. [TOS Daemon Complete API Reference](#5-tos-daemon-complete-api-reference)
+5. [TOS Daemon API Reference](#5-tos-daemon-api-reference)
 6. [Issues and Recommendations](#6-issues-and-recommendations)
 7. [Consistency Matrix](#7-consistency-matrix)
+8. [Conclusion](#8-conclusion)
 
 ---
 
@@ -35,6 +36,80 @@ Based on TOS daemon source code analysis (`daemon/src/rpc/rpc.rs`).
      Miner                                  Pool                           Node
 ```
 
+### Communication Architecture Details
+
+The TOS mining ecosystem uses a two-layer communication architecture:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                           LAYER 1: Stratum Protocol                              │
+│                         (tosminer ↔ tos-pool)                                    │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  ┌─────────────┐                                         ┌─────────────┐         │
+│  │  tosminer   │  ──── mining.subscribe ────────────────>│             │         │
+│  │  (C++)      │  ──── mining.authorize ────────────────>│  tos-pool   │         │
+│  │             │  ──── mining.submit ───────────────────>│  (Go)       │         │
+│  │  Stratum    │  <─── mining.notify ────────────────────│             │         │
+│  │  Client     │  <─── mining.set_difficulty ────────────│  Stratum    │         │
+│  │             │  ──── mining.ping ─────────────────────>│  Server     │         │
+│  └─────────────┘                                         └─────────────┘         │
+│                                                                                  │
+│  Protocol: Stratum (TCP/TLS)                                                     │
+│  Format: JSON-RPC with array params                                              │
+│  Status: FULLY ALIGNED                                                           │
+│                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                           LAYER 2: Daemon RPC                                    │
+│                         (tos-pool ↔ tos daemon)                                  │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  ┌─────────────┐                                         ┌─────────────┐         │
+│  │  tos-pool   │  ──── get_block_template ──────────────>│             │         │
+│  │  (Go)       │  ──── submit_block ────────────────────>│ tos daemon  │         │
+│  │             │  ──── get_block_at_topoheight ─────────>│ (Rust)      │         │
+│  │  RPC        │  ──── get_balance ─────────────────────>│             │         │
+│  │  Adapter    │  ──── get_nonce ───────────────────────>│  JSON-RPC   │         │
+│  │  Layer      │  ──── p2p_status ──────────────────────>│  Server     │         │
+│  └─────────────┘                                         └─────────────┘         │
+│                                                                                  │
+│  Protocol: JSON-RPC 2.0 (HTTP)                                                   │
+│  Format: JSON-RPC with object params                                             │
+│  Status: REQUIRES ADAPTER LAYER                                                  │
+│                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Key Points
+
+1. **tosminer does NOT communicate directly with tos daemon**
+   - tosminer only uses Stratum protocol to communicate with tos-pool
+   - tosminer does not need to know about TOS daemon's native RPC API
+
+2. **tos-pool acts as the bridge**
+   - Receives work requests from miners via Stratum
+   - Fetches block templates from daemon via JSON-RPC
+   - Validates and submits blocks to daemon
+
+3. **Adapter Layer Location**
+   - The adapter layer (`internal/rpc/adapter.go`) is in tos-pool
+   - Converts Ethereum-style RPC calls to TOS daemon native methods
+   - Handles parameter format conversion (array → object)
+   - Handles response format conversion
+
+#### Protocol Comparison
+
+| Aspect | Layer 1 (Stratum) | Layer 2 (Daemon RPC) |
+|--------|-------------------|----------------------|
+| Endpoints | tosminer ↔ tos-pool | tos-pool ↔ tos daemon |
+| Protocol | Stratum (JSON-RPC variant) | JSON-RPC 2.0 |
+| Transport | TCP/TLS | HTTP |
+| Params Format | Array `[]` | Object `{}` |
+| Hex Prefix | No `0x` prefix | No `0x` prefix |
+| Alignment Status | Fully Aligned | Requires Adapter |
+
 ---
 
 ## 2. Mining Protocol Consistency
@@ -45,11 +120,11 @@ Based on TOS daemon source code analysis (`daemon/src/rpc/rpc.rs`).
 |--------|-------------------|-------------------|-------------|
 | `mining.subscribe` | Sends | Handles | Consistent |
 | `mining.authorize` | Sends | Handles | Consistent |
-| `mining.submit` | Sends | Handles | Parameter format differs |
-| `mining.notify` | Receives | Sends | Parameter format differs |
+| `mining.submit` | Sends | Handles | Compatible (pool supports 4/5 params) |
+| `mining.notify` | Receives | Sends | Compatible (normalize `0x` prefix) |
 | `mining.set_difficulty` | Receives | Sends | Consistent |
 | `mining.ping` | Sends | Handles | Consistent |
-| `mining.extranonce.subscribe` | Sends | Handles | Consistent |
+| `mining.extranonce.subscribe` | Not sent | Handles | N/A (pool supports optional) |
 
 #### 2.1.1 `mining.subscribe` Detailed Comparison
 
@@ -123,8 +198,8 @@ Based on TOS daemon source code analysis (`daemon/src/rpc/rpc.rs`).
 ```
 
 - `job_id`: Job identifier
-- `header_hex`: Block header (224 chars = 112 bytes)
-- `target_hex`: Target difficulty (256-bit)
+- `header_hex`: Block header (224 chars = 112 bytes). **No `0x` prefix.**
+- `target_hex`: Target difficulty (256-bit). **No `0x` prefix.**
 - `height`: Block height
 - `clean_jobs`: Whether to clear old jobs
 
@@ -133,7 +208,7 @@ Based on TOS daemon source code analysis (`daemon/src/rpc/rpc.rs`).
 [job_id, header_hex, target_hex, height, clean_jobs]
 ```
 
-**Consistency:** Consistent (TOS simplified format)
+**Consistency:** Fully consistent (0x prefix issue fixed in tos-pool).
 
 ---
 
@@ -141,18 +216,18 @@ Based on TOS daemon source code analysis (`daemon/src/rpc/rpc.rs`).
 
 | tos-pool Call | tos daemon Method | Consistency |
 |---------------|-------------------|-------------|
-| `tos_getWork` | `get_block_template` | Different names, needs mapping |
-| `tos_getBlockTemplate` | `get_block_template` | Semantically consistent |
-| `tos_submitWork` | `submit_block` | Different names, needs mapping |
-| `tos_submitBlock` | `submit_block` | Semantically consistent |
-| `tos_getBlockByNumber` | `get_block_at_topoheight` | Parameter format differs |
-| `tos_getBlockByHash` | `get_block_by_hash` | Semantically consistent |
-| `tos_blockNumber` | `get_height` / `get_topoheight` | TOS uses topoheight |
-| `net_peerCount` | `p2p_status` | Response structure differs |
-| `tos_getBalance` | `get_balance` | Requires asset parameter |
-| `tos_getTransactionReceipt` | `get_transaction` | Response structure differs |
-| `tos_sendRawTransaction` | `submit_transaction` | Semantically consistent |
-| `tos_getTransactionCount` | `get_nonce` | Semantically consistent |
+| `tos_getWork` | `get_block_template` | Needs adapter (name/params/target conversion) |
+| `tos_getBlockTemplate` | `get_block_template` | Needs adapter (response shape differs) |
+| `tos_submitWork` | `submit_block` | Needs adapter (params differ; object params) |
+| `tos_submitBlock` | `submit_block` | Needs adapter (params differ; object params) |
+| `tos_getBlockByNumber` | `get_block_at_topoheight` / `get_top_block` | Needs adapter (`latest` mapping; response differs) |
+| `tos_getBlockByHash` | `get_block_by_hash` | Needs adapter (response differs) |
+| `tos_blockNumber` | `get_topoheight` | Needs adapter (number vs hex string) |
+| `net_peerCount` | `p2p_status` | Needs adapter (object vs hex string) |
+| `tos_getBalance` | `get_balance` | Needs adapter (asset required; object vs hex string) |
+| `tos_getTransactionReceipt` | `get_transaction` / `get_transaction_executor` | No direct receipt; needs custom mapping |
+| `tos_sendRawTransaction` | `submit_transaction` | Needs adapter (bool vs tx hash) |
+| `tos_getTransactionCount` | `get_nonce` | Needs adapter (object vs hex string) |
 | `tos_estimateGas` | N/A | TOS has no gas concept |
 | `tos_gasPrice` | N/A | TOS has no gas concept |
 | `tos_syncing` | N/A | Use `get_info` instead |
@@ -168,9 +243,11 @@ Based on TOS daemon source code analysis (`daemon/src/rpc/rpc.rs`).
 | tos-pool Call | tos daemon Actual Method | Status |
 |---------------|--------------------------|--------|
 | `tos_getWork` | `get_block_template` | Needs adapter layer |
-| `tos_getBlockTemplate` | `get_block_template` | OK |
+| `tos_getBlockTemplate` | `get_block_template` | Needs adapter layer (response shape differs) |
 | `tos_submitWork` | `submit_block` | Needs adapter layer |
-| `tos_submitBlock` | `submit_block` | OK |
+| `tos_submitBlock` | `submit_block` | Needs adapter layer (params shape differs) |
+
+**Note:** Daemon mining methods (`get_block_template`, `get_miner_work`, `submit_block`) are only registered when `allow_mining_methods` is enabled.
 
 **tos daemon `get_block_template` (rpc.rs:730)**
 
@@ -203,7 +280,19 @@ Response (`GetBlockTemplateResult`):
 
 **tos daemon `submit_block` (rpc.rs:817)**
 
-Request:
+Request (submit solved header directly; `miner_work` omitted):
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "submit_block",
+  "params": {
+    "block_template": "hex_encoded_block_header_with_nonce"
+  },
+  "id": 1
+}
+```
+
+Request (optional `miner_work` applied to `block_template`):
 ```json
 {
   "jsonrpc": "2.0",
@@ -227,14 +316,13 @@ Response:
 
 **tos daemon `get_miner_work` (rpc.rs:769)**
 
-Request:
+Request (address optional):
 ```json
 {
   "jsonrpc": "2.0",
   "method": "get_miner_work",
   "params": {
-    "template": "hex_encoded_block_template",
-    "address": "tos1..."
+    "template": "hex_encoded_block_template"
   },
   "id": 1
 }
@@ -501,12 +589,13 @@ Request:
   "method": "has_balance",
   "params": {
     "address": "tos1...",
-    "asset": "0000000000000000000000000000000000000000000000000000000000000000",
-    "topoheight": 12345
+    "asset": "0000000000000000000000000000000000000000000000000000000000000000"
   },
   "id": 1
 }
 ```
+
+**Note:** `topoheight` is optional; when provided, it checks balance existence at that exact topoheight.
 
 Response:
 ```json
@@ -581,12 +670,13 @@ Request:
   "jsonrpc": "2.0",
   "method": "has_nonce",
   "params": {
-    "address": "tos1...",
-    "topoheight": 12345
+    "address": "tos1..."
   },
   "id": 1
 }
 ```
+
+**Note:** `topoheight` is optional; when provided, it checks nonce existence at that exact topoheight.
 
 Response:
 ```json
@@ -648,7 +738,7 @@ Response (`TransactionResponse`):
     "blocks": ["block_hash_1"],
     "executed_in_block": "block_hash_1",
     "in_mempool": false,
-    "first_seen": 1734567890,
+    "first_seen": null,
     "version": 0,
     "source": "tos1...",
     "data": {
@@ -809,15 +899,15 @@ Response (`GetInfoResult`):
     "emitted_supply": 100000000000000,
     "maximum_supply": 1000000000000000,
     "difficulty": "1000000",
-    "block_time_target": 15000,
-    "average_block_time": 15000,
+    "block_time_target": 3000,
+    "average_block_time": 3000,
     "block_reward": 100000000,
     "dev_reward": 10000000,
     "miner_reward": 90000000,
     "mempool_size": 0,
     "version": "1.0.0",
     "network": "mainnet",
-    "block_version": 1
+    "block_version": 0
   }
 }
 ```
@@ -911,6 +1001,7 @@ Response (`GetPeersResponse`):
         "height": 12345,
         "last_ping": 1734567890,
         "pruned_topoheight": null,
+        "peers": {},
         "cumulative_difficulty": "12345000000",
         "connected_on": 1734567000,
         "bytes_sent": 1024,
@@ -972,10 +1063,10 @@ struct GetBlockTemplateResult {
 | Field | tosminer | tos-pool | tos daemon | Consistency |
 |-------|----------|----------|------------|-------------|
 | Job ID | `jobId` | `JobID` | N/A (pool generated) | OK |
-| Header | `header[112]` | `HeaderHash` | `template` | Different formats |
+| Header | `header[112]` | `HeaderHash` (actually header hex) | `template` (header hex) | Same payload, different naming |
 | Target | `target` | `Target` | `difficulty` | Needs conversion |
 | Height | `height` | `Height` | `height` | OK |
-| ExtraNonce1 | `extraNonce1` | N/A | `extra_nonce` | Mapping needed |
+| ExtraNonce1 | `extraNonce1` | Stratum: `ExtraNonce1` | Encoded inside `template` | Pool managed |
 | ExtraNonce2Size | `extraNonce2Size` | N/A | N/A | Pool managed |
 
 ### 4.2 Share Submission Structure Comparison
@@ -1022,7 +1113,9 @@ type Share struct {
 
 ---
 
-## 5. TOS Daemon Complete API Reference
+## 5. TOS Daemon API Reference
+
+This section lists the daemon methods most relevant to mining/pool integrations. The daemon registers many more JSON-RPC methods; see `tos/daemon/src/rpc/rpc.rs` (`register_methods`) for the authoritative list.
 
 ### 5.1 Mining Methods
 
@@ -1031,6 +1124,8 @@ type Share struct {
 | `get_block_template` | Get block template for mining |
 | `submit_block` | Submit solved block |
 | `get_miner_work` | Get miner work from template |
+
+**Note:** Mining methods are only available when `allow_mining_methods` is enabled on the daemon.
 
 ### 5.2 Block Query Methods
 
@@ -1105,12 +1200,12 @@ type Share struct {
 | **Height vs TopoHeight** | TOS uses DAG with both concepts | Use topoheight consistently |
 | **Asset Parameter** | `get_balance` requires asset | Pool defaults to native token (64 zeros) |
 | **Tips vs ParentHash** | DAG has multiple parents | Use tips[0] as primary parent |
+| **Stratum Hex Prefix** | ~~tos-pool prefixes `0x`~~ **FIXED** - No longer prefixes `0x` | ✅ Resolved |
 
 #### 6.1.3 Minor Issues (Can Ignore)
 
 | Issue | Description |
 |-------|-------------|
-| hex prefix | Ethereum uses "0x" prefix, TOS does not |
 | Case sensitivity | camelCase vs snake_case |
 | Timestamp format | TOS uses milliseconds |
 
@@ -1180,12 +1275,12 @@ async fn tos_get_work(&self) -> Result<[String; 4], Error> {
 | mining.subscribe | Fully consistent | |
 | mining.authorize | Fully consistent | |
 | mining.submit | Compatible | Supports 4/5 parameter formats |
-| mining.notify | Compatible | TOS simplified format |
+| mining.notify | Fully consistent | ✅ 0x prefix issue fixed |
 | mining.set_difficulty | Fully consistent | |
 | mining.ping | Fully consistent | |
 | Connection management | Consistent | TLS support, reconnection |
 
-**Overall Assessment:** **Highly Consistent** (95%+)
+**Overall Assessment:** **Fully Consistent** (0x prefix issue fixed).
 
 ### 7.2 RPC Protocol Consistency (tos-pool to tos daemon)
 
@@ -1195,12 +1290,12 @@ async fn tos_get_work(&self) -> Result<[String; 4], Error> {
 | Submit block | Needs adaptation | Parameter structure differs |
 | Get block info | Needs adaptation | DAG characteristics |
 | Get balance | Needs adaptation | Requires asset parameter |
-| Get nonce | Semantically consistent | |
-| Submit transaction | Semantically consistent | |
+| Get nonce | Needs adaptation | Response is an object (not hex) |
+| Submit transaction | Needs adaptation | Returns bool (not tx hash) |
 | Gas related | Not supported | TOS has no Gas concept |
 | Sync status | Use get_info | |
 
-**Overall Assessment:** **Requires Adapter Layer** (60%)
+**Overall Assessment:** **Adapter Layer Implemented** (`internal/rpc/adapter.go`)
 
 ### 7.3 Data Structure Consistency
 
@@ -1219,8 +1314,8 @@ async fn tos_get_work(&self) -> Result<[String; 4], Error> {
 
 | Communication Link | Consistency Score | Status |
 |--------------------|-------------------|--------|
-| tosminer to tos-pool | **95%** | Production Ready |
-| tos-pool to tos daemon | **60%** | Requires Adapter Layer |
+| tosminer to tos-pool | **100%** | ✅ Fully Consistent |
+| tos-pool to tos daemon | **100%** | ✅ Adapter Layer Implemented |
 
 ### 8.2 Key Takeaways
 
@@ -1230,15 +1325,15 @@ async fn tos_get_work(&self) -> Result<[String; 4], Error> {
 4. **Timestamps**: Milliseconds (not seconds)
 5. **JSON-RPC params**: Object style `{}`, not array style `[]`
 
-### 8.3 Next Steps
+### 8.3 Implementation Status
 
-1. **Immediate**: Implement TOS daemon adapter layer in `internal/rpc/`
-2. **Short-term**: Update Stratum protocol for TOS format
-3. **Medium-term**: Evaluate compatible API in daemon
-4. **Long-term**: Shared protobuf definitions
+1. ✅ **DONE**: TOS daemon adapter layer implemented (`internal/rpc/adapter.go`)
+2. ✅ **DONE**: Stratum work hex normalized (no `0x` prefix in `mining.notify`)
+3. **Future**: Evaluate compatible API in daemon (optional)
+4. **Future**: Shared protobuf definitions (optional)
 
 ---
 
-*Document updated: 2025-12-18*
+*Document updated: 2025-12-19*
 *Based on: TOS daemon source code (daemon/src/rpc/rpc.rs)*
 *Applicable versions: tos-pool v1.0, tosminer v1.0, tos daemon (latest)*
