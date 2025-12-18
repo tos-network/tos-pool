@@ -498,9 +498,17 @@ func (c *TOSClient) GetNetworkInfo(ctx context.Context) (*NetworkInfo, error) {
 	// Determine if syncing
 	syncing := p2p.OurTopoHeight < p2p.BestTopoHeight
 
+	// Calculate network hashrate: difficulty / average_block_time_seconds
+	// AverageBlockTime is in milliseconds, so we multiply difficulty by 1000
+	var hashrate uint64
+	if info.AverageBlockTime > 0 {
+		hashrate = parseDifficulty(info.Difficulty) * 1000 / info.AverageBlockTime
+	}
+
 	return &NetworkInfo{
 		Height:     info.TopoHeight,
 		Difficulty: parseDifficulty(info.Difficulty),
+		Hashrate:   hashrate,
 		PeerCount:  int(p2p.PeerCount),
 		Syncing:    syncing,
 		GasPrice:   0, // TOS has no gas
