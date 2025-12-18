@@ -7,6 +7,17 @@ const api = axios.create({
   timeout: 10000
 })
 
+// Convert period string to hours
+function periodToHours(period) {
+  switch (period) {
+    case '1h': return 1
+    case '6h': return 6
+    case '24h': return 24
+    case '7d': return 168
+    default: return 24
+  }
+}
+
 export const poolApi = {
   // Get pool and network stats
   async getStats() {
@@ -65,30 +76,46 @@ export const poolApi = {
   // Get pool hashrate history
   async getPoolHashrateHistory(period = '24h') {
     try {
-      const { data } = await api.get(`/stats/hashrate?period=${period}`)
-      return data.history || []
+      const hours = periodToHours(period)
+      const { data } = await api.get(`/chart/hashrate?hours=${hours}`)
+      // Transform points to expected format
+      return (data.points || []).map(p => ({
+        timestamp: p.timestamp,
+        hashrate: p.hashrate
+      }))
     } catch (err) {
-      return generateMockHashrateHistory(period)
+      console.warn('Failed to fetch hashrate history:', err)
+      return []
     }
   },
 
   // Get miner hashrate history
   async getMinerHashrateHistory(address, period = '24h') {
     try {
-      const { data } = await api.get(`/miners/${address}/hashrate?period=${period}`)
-      return data.history || []
+      const hours = periodToHours(period)
+      const { data } = await api.get(`/miners/${address}/chart?hours=${hours}`)
+      return (data.points || []).map(p => ({
+        timestamp: p.timestamp,
+        hashrate: p.hashrate
+      }))
     } catch (err) {
-      return generateMockHashrateHistory(period, 0.001) // Lower scale for miner
+      console.warn('Failed to fetch miner hashrate history:', err)
+      return []
     }
   },
 
   // Get workers count history
   async getWorkersHistory(period = '24h') {
     try {
-      const { data } = await api.get(`/stats/workers?period=${period}`)
-      return data.history || []
+      const hours = periodToHours(period)
+      const { data } = await api.get(`/chart/workers?hours=${hours}`)
+      return (data.points || []).map(p => ({
+        timestamp: p.timestamp,
+        count: p.count
+      }))
     } catch (err) {
-      return generateMockWorkersHistory(period)
+      console.warn('Failed to fetch workers history:', err)
+      return []
     }
   }
 }

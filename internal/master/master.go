@@ -156,6 +156,10 @@ func (m *Master) Start() error {
 	m.wg.Add(1)
 	go m.statsUpdateLoop()
 
+	// Start hashrate history recorder (every minute)
+	m.wg.Add(1)
+	go m.hashrateHistoryLoop()
+
 	util.Info("Pool master started")
 	return nil
 }
@@ -792,6 +796,47 @@ func (m *Master) updateStats() {
 	}
 
 	m.redis.SetNetworkStats(stats)
+}
+
+// hashrateHistoryLoop stores hashrate snapshots for charting
+func (m *Master) hashrateHistoryLoop() {
+	defer m.wg.Done()
+
+	// Store initial snapshot
+	m.storeHashrateSnapshot()
+
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-ticker.C:
+			m.storeHashrateSnapshot()
+		}
+	}
+}
+
+// storeHashrateSnapshot stores current hashrate data for history charts
+func (m *Master) storeHashrateSnapshot() {
+	// Get pool stats
+	poolStats, err := m.redis.GetPoolStats(m.cfg.Validation.HashrateWindow, m.cfg.Validation.HashrateLargeWindow)
+	if err != nil {
+		util.Warnf("Failed to get pool stats for history: %v", err)
+		return
+	}
+
+	// Store pool hashrate and workers count
+	if poolStats != nil {
+		if err := m.redis.StorePoolHashrate(poolStats.Hashrate); err != nil {
+			util.Warnf("Failed to store pool hashrate: %v", err)
+		}
+
+		if err := m.redis.StoreWorkersCount(int(poolStats.Workers)); err != nil {
+			util.Warnf("Failed to store workers count: %v", err)
+		}
+	}
 }
 
 // GetStats returns current pool statistics

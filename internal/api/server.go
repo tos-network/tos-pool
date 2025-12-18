@@ -148,6 +148,7 @@ func (s *Server) setupRoutes() {
 		api.GET("/miners/:address/chart", s.handleMinerChart)
 		api.GET("/luck", s.handleLuck)
 		api.GET("/chart/hashrate", s.handlePoolHashrateChart)
+		api.GET("/chart/workers", s.handleWorkersChart)
 	}
 
 	// Admin API (password protected)
@@ -624,6 +625,31 @@ func (s *Server) handlePoolHashrateChart(c *gin.Context) {
 	history, err := s.redis.GetPoolHashrateHistory(hours)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "Failed to get hashrate history"})
+		return
+	}
+
+	c.JSON(200, gin.H{
+		"hours":  hours,
+		"points": history,
+	})
+}
+
+// handleWorkersChart returns workers count history
+func (s *Server) handleWorkersChart(c *gin.Context) {
+	hoursStr := c.DefaultQuery("hours", "24")
+	hours := 24
+	if h, err := parseHours(hoursStr); err == nil {
+		hours = h
+	}
+
+	// Limit to 168 hours (7 days)
+	if hours > 168 {
+		hours = 168
+	}
+
+	history, err := s.redis.GetWorkersHistory(hours)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to get workers history"})
 		return
 	}
 

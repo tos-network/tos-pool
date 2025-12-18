@@ -1143,12 +1143,19 @@ const (
 	keyHashratePool   = keyPrefix + "hashrate:pool"
 	keyHashrateMiner  = keyPrefix + "hashrate:miner:%s"
 	keyHashrateWorker = keyPrefix + "hashrate:worker:%s:%s"
+	keyWorkersHistory = keyPrefix + "workers:history"
 )
 
 // HashratePoint represents a single hashrate data point
 type HashratePoint struct {
-	Timestamp int64   `json:"t"`
-	Hashrate  float64 `json:"h"`
+	Timestamp int64   `json:"timestamp"`
+	Hashrate  float64 `json:"hashrate"`
+}
+
+// WorkersPoint represents a single workers count data point
+type WorkersPoint struct {
+	Timestamp int64 `json:"timestamp"`
+	Count     int   `json:"count"`
 }
 
 // StorePoolHashrate stores a pool hashrate sample
@@ -1249,6 +1256,50 @@ func (r *RedisClient) getHashrateHistory(key string, since int64) ([]HashratePoi
 	points := make([]HashratePoint, 0, len(results))
 	for _, result := range results {
 		var point HashratePoint
+		if err := json.Unmarshal([]byte(result), &point); err == nil {
+			points = append(points, point)
+		}
+	}
+
+	return points, nil
+}
+
+// StoreWorkersCount stores a workers count sample
+func (r *RedisClient) StoreWorkersCount(count int) error {
+	point := WorkersPoint{
+		Timestamp: time.Now().Unix(),
+		Count:     count,
+	}
+	data, _ := json.Marshal(point)
+
+	pipe := r.client.Pipeline()
+	pipe.ZAdd(r.ctx, keyWorkersHistory, &redis.Z{
+		Score:  float64(point.Timestamp),
+		Member: string(data),
+	})
+	// Keep last 7 days of data
+	cutoff := time.Now().Unix() - 604800
+	pipe.ZRemRangeByScore(r.ctx, keyWorkersHistory, "0", fmt.Sprintf("%d", cutoff))
+
+	_, err := pipe.Exec(r.ctx)
+	return err
+}
+
+// GetWorkersHistory returns workers count history
+func (r *RedisClient) GetWorkersHistory(hours int) ([]WorkersPoint, error) {
+	cutoff := time.Now().Unix() - int64(hours*3600)
+
+	results, err := r.client.ZRangeByScore(r.ctx, keyWorkersHistory, &redis.ZRangeBy{
+		Min: fmt.Sprintf("%d", cutoff),
+		Max: "+inf",
+	}).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	points := make([]WorkersPoint, 0, len(results))
+	for _, result := range results {
+		var point WorkersPoint
 		if err := json.Unmarshal([]byte(result), &point); err == nil {
 			points = append(points, point)
 		}

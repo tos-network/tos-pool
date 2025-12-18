@@ -5,7 +5,15 @@
     <!-- Stats Cards -->
     <div class="stats-grid">
       <div class="stat-card">
-        <div class="stat-icon hashrate-icon"></div>
+        <div class="stat-icon hashrate-icon">
+          <!-- Pool Hashrate Icon: Speedometer/Gauge -->
+          <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z" fill="currentColor" opacity="0.3"/>
+            <path d="M12 6v2M6 12H4M20 12h-2M7.76 7.76l1.42 1.42M16.24 7.76l-1.42 1.42" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <path d="M12 12l3.5-3.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+            <circle cx="12" cy="12" r="2" fill="currentColor"/>
+          </svg>
+        </div>
         <div class="stat-content">
           <span class="stat-label">Pool Hashrate</span>
           <span class="stat-value">{{ formatHashrate(poolStore.poolHashrate) }}</span>
@@ -13,7 +21,16 @@
       </div>
 
       <div class="stat-card">
-        <div class="stat-icon miners-icon"></div>
+        <div class="stat-icon miners-icon">
+          <!-- Miners/Workers Icon: Team/People -->
+          <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="9" cy="7" r="3" fill="currentColor" opacity="0.3"/>
+            <circle cx="9" cy="7" r="2" stroke="currentColor" stroke-width="2"/>
+            <path d="M3 19v-1c0-2.21 2.69-4 6-4s6 1.79 6 4v1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <circle cx="17" cy="8" r="2" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M17 12c2.21 0 4 1.34 4 3v1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </div>
         <div class="stat-content">
           <span class="stat-label">Miners / Workers</span>
           <span class="stat-value">{{ formatNumber(poolStore.minerCount) }} / {{ formatNumber(poolStore.workerCount) }}</span>
@@ -21,7 +38,16 @@
       </div>
 
       <div class="stat-card">
-        <div class="stat-icon blocks-icon"></div>
+        <div class="stat-icon blocks-icon">
+          <!-- Blocks Found Icon: 3D Cube -->
+          <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M12 2L3 7v10l9 5 9-5V7l-9-5z" fill="currentColor" opacity="0.15"/>
+            <path d="M12 2L3 7l9 5 9-5-9-5z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+            <path d="M3 7v10l9 5V12" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+            <path d="M21 7v10l-9 5V12" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+            <path d="M12 12v10" stroke="currentColor" stroke-width="2"/>
+          </svg>
+        </div>
         <div class="stat-content">
           <span class="stat-label">Blocks Found</span>
           <span class="stat-value">{{ formatNumber(poolStore.blocksFound) }}</span>
@@ -29,7 +55,16 @@
       </div>
 
       <div class="stat-card">
-        <div class="stat-icon network-icon"></div>
+        <div class="stat-icon network-icon">
+          <!-- Network Hashrate Icon: Globe with connections -->
+          <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2" opacity="0.3"/>
+            <ellipse cx="12" cy="12" rx="4" ry="9" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M3 12h18" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M4.5 7h15M4.5 17h15" stroke="currentColor" stroke-width="1.5" opacity="0.6"/>
+            <circle cx="12" cy="12" r="2" fill="currentColor"/>
+          </svg>
+        </div>
         <div class="stat-content">
           <span class="stat-label">Network Hashrate</span>
           <span class="stat-value">{{ formatHashrate(poolStore.networkHashrate) }}</span>
