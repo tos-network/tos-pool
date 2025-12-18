@@ -1,32 +1,99 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
+# Binaries
+bin/
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
 
-# Test binary, built with `go test -c`
+# Test binary
 *.test
 
-# Code coverage profiles and other test artifacts
+# Code coverage
 *.out
 coverage.*
 *.coverprofile
 profile.cov
+coverage.html
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
-
-# Go workspace file
+# Go workspace
 go.work
 go.work.sum
 
-# env file
-.env
+# Dependency directories
+vendor/
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+!*.example.pem
+
+# Configuration (use .example versions)
+config/config.yaml
+config/config.*.yaml
+!config/config.example.yaml
+*.local.yaml
+
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.orig
+*.bak
+.project
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*.directory
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.cache
+tmp/
+
+# Redis dump
+dump.rdb
+
+# Docker
+docker-compose.override.yml
+
+# Web frontend build
+web/node_modules/
+web/dist/
+web/.env
+web/.env.*
+
+# Test and debug
+debug/
+*.prof
+*.pprof
+*.trace
+
+# Air live reload
+tmp/
+
+# Delve debugger
+__debug_bin

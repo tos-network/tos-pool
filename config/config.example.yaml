@@ -1,0 +1,92 @@
+# TOS Pool Configuration
+
+# Pool identity
+pool:
+  name: "TOS Mining Pool"
+  fee: 1.0                      # 1% pool fee
+  fee_address: "tos1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+
+# TOS node connection
+node:
+  url: "http://127.0.0.1:8545"
+  timeout: 10s
+
+# Redis database
+redis:
+  url: "127.0.0.1:6379"
+  password: ""
+  db: 0
+
+# Master server settings
+master:
+  enabled: true
+  bind: "0.0.0.0:3221"
+  secret: "change_this_to_a_secure_random_string"
+
+# Slave server settings
+slave:
+  enabled: true
+  master_url: "127.0.0.1:3221"
+  stratum_bind: "0.0.0.0:3333"
+  stratum_tls_bind: "0.0.0.0:3334"
+  tls_cert: ""
+  tls_key: ""
+
+# Mining settings
+mining:
+  initial_difficulty: 1000000
+  min_difficulty: 1000
+  max_difficulty: 1000000000000
+  vardiff_target_time: 4        # Target 4 seconds per share
+  vardiff_retarget: 90          # Retarget every 90 seconds
+  vardiff_variance: 30          # 30% variance tolerance
+  job_refresh_interval: 500ms   # Refresh jobs every 500ms
+
+# Share validation
+validation:
+  trust_threshold: 50           # Valid shares before trusting miner
+  trust_check_percent: 75       # Check 75% of trusted shares
+  hashrate_window: 10m          # Hashrate calculation window
+  hashrate_large_window: 3h     # Large window for history
+
+# Block processing
+unlocker:
+  enabled: true
+  interval: 60s                 # Check every 60 seconds
+  immature_depth: 10            # Blocks before marking immature
+  mature_depth: 100             # Blocks before marking mature
+
+# PPLNS settings
+pplns:
+  window: 2.0                   # Window = 2x network difficulty
+
+# Payment processing
+payouts:
+  enabled: true
+  interval: 1h                  # Process every hour
+  threshold: 100000000          # 0.1 TOS minimum (8 decimals)
+  max_addresses_per_tx: 100     # Max recipients per transaction
+  gas_limit: 21000
+  gas_price: "auto"             # "auto" or fixed value in wei
+
+# API server
+api:
+  enabled: true
+  bind: "0.0.0.0:8080"
+  stats_cache: 10s              # Cache stats for 10 seconds
+  cors_origins:
+    - "*"
+
+# Security settings
+security:
+  max_connections_per_ip: 100
+  max_workers_per_address: 256
+  ban_threshold: 30             # Ban at 30% invalid shares
+  ban_duration: 1h              # Ban for 1 hour
+  rate_limit_shares: 100        # Max shares per second per IP
+
+# Logging
+log:
+  level: "info"                 # debug, info, warn, error
+  format: "console"             # console or json
+  file: ""                      # Optional log file path
