@@ -79,6 +79,8 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	upstreamMgr := rpc.NewUpstreamManager(ctx, &cfg.Node)
+	// Set pool's fee address as miner address for get_block_template
+	upstreamMgr.SetMinerAddress(cfg.Pool.FeeAddress)
 	upstreamMgr.Start()
 
 	var masterCoord *master.Master

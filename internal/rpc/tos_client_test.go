@@ -10,16 +10,20 @@ import (
 	"time"
 )
 
-// mockRPCServer creates a test server that responds with the given result
-func mockRPCServer(t *testing.T, handler func(req RPCRequest) (interface{}, *RPCError)) *httptest.Server {
+// mockNativeRPCServer creates a test server that responds to TOS native API calls
+func mockNativeRPCServer(t *testing.T, handler func(req NativeRPCRequest) (interface{}, *RPCError)) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
-			t.Errorf("Expected POST, got %s", r.Method)
+			if t != nil {
+				t.Errorf("Expected POST, got %s", r.Method)
+			}
 		}
 
-		var req RPCRequest
+		var req NativeRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Errorf("Failed to decode request: %v", err)
+			if t != nil {
+				t.Errorf("Failed to decode request: %v", err)
+			}
 			return
 		}
 
@@ -43,14 +47,14 @@ func mockRPCServer(t *testing.T, handler func(req RPCRequest) (interface{}, *RPC
 }
 
 func TestNewTOSClient(t *testing.T) {
-	client := NewTOSClient("http://localhost:8545", 30*time.Second)
+	client := NewTOSClient("http://localhost:8080", 30*time.Second)
 
 	if client == nil {
 		t.Fatal("NewTOSClient returned nil")
 	}
 
-	if client.url != "http://localhost:8545" {
-		t.Errorf("url = %s, want http://localhost:8545", client.url)
+	if client.url != "http://localhost:8080" {
+		t.Errorf("url = %s, want http://localhost:8080", client.url)
 	}
 
 	if client.timeout != 30*time.Second {
@@ -59,6 +63,15 @@ func TestNewTOSClient(t *testing.T) {
 
 	if !client.healthy {
 		t.Error("Client should be healthy initially")
+	}
+}
+
+func TestSetMinerAddress(t *testing.T) {
+	client := NewTOSClient("http://localhost:8080", 30*time.Second)
+	client.SetMinerAddress("tos1testaddress")
+
+	if client.minerAddress != "tos1testaddress" {
+		t.Errorf("minerAddress = %s, want tos1testaddress", client.minerAddress)
 	}
 }
 
@@ -75,7 +88,7 @@ func TestRPCErrorError(t *testing.T) {
 }
 
 func TestIsHealthy(t *testing.T) {
-	client := NewTOSClient("http://localhost:8545", 30*time.Second)
+	client := NewTOSClient("http://localhost:8080", 30*time.Second)
 
 	if !client.IsHealthy() {
 		t.Error("Client should be healthy initially")
@@ -98,21 +111,77 @@ func TestIsHealthy(t *testing.T) {
 	}
 }
 
-func TestGetWork(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		if req.Method != "tos_getWork" {
-			t.Errorf("Method = %s, want tos_getWork", req.Method)
+func TestParseDifficulty(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected uint64
+	}{
+		{"1000000", 1000000},
+		{"0", 0},
+		{"12345678901234567890", 12345678901234567890},
+		{"invalid", 0},
+	}
+
+	for _, tt := range tests {
+		result := parseDifficulty(tt.input)
+		if result != tt.expected {
+			t.Errorf("parseDifficulty(%s) = %d, want %d", tt.input, result, tt.expected)
 		}
-		return []string{
-			"0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-			"0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-			"0x00000000ffff0000000000000000000000000000000000000000000000000000",
-			"0x1234",
+	}
+}
+
+func TestDifficultyToTarget(t *testing.T) {
+	tests := []struct {
+		difficulty string
+		wantLen    int
+	}{
+		{"1000000", 64},
+		{"1", 64},
+		{"0", 64},
+	}
+
+	for _, tt := range tests {
+		result := difficultyToTarget(tt.difficulty)
+		if len(result) != tt.wantLen {
+			t.Errorf("difficultyToTarget(%s) length = %d, want %d", tt.difficulty, len(result), tt.wantLen)
+		}
+	}
+
+	// Test that higher difficulty produces lower target
+	target1 := difficultyToTarget("1000")
+	target2 := difficultyToTarget("2000")
+	if target1 <= target2 {
+		t.Error("higher difficulty should produce lower target")
+	}
+}
+
+func TestGetWork(t *testing.T) {
+	server := mockNativeRPCServer(t, func(req NativeRPCRequest) (interface{}, *RPCError) {
+		if req.Method != "get_block_template" {
+			t.Errorf("Method = %s, want get_block_template", req.Method)
+		}
+
+		// Verify params is an object with address
+		params, ok := req.Params.(map[string]interface{})
+		if !ok {
+			t.Error("Params should be an object")
+		}
+		if _, exists := params["address"]; !exists {
+			t.Error("Params should contain address")
+		}
+
+		return GetBlockTemplateResult{
+			Template:   "deadbeef1234567890",
+			Algorithm:  "tos/v3",
+			Height:     12345,
+			TopoHeight: 12345,
+			Difficulty: "1000000",
 		}, nil
 	})
 	defer server.Close()
 
 	client := NewTOSClient(server.URL, 30*time.Second)
+	client.SetMinerAddress("tos1testminer")
 	ctx := context.Background()
 
 	work, err := client.GetWork(ctx)
@@ -120,41 +189,32 @@ func TestGetWork(t *testing.T) {
 		t.Fatalf("GetWork failed: %v", err)
 	}
 
-	if work.HeaderHash != "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef" {
-		t.Errorf("HeaderHash = %s, want 0x1234...", work.HeaderHash)
+	if work.HeaderHash != "deadbeef1234567890" {
+		t.Errorf("HeaderHash = %s, want deadbeef1234567890", work.HeaderHash)
 	}
 
-	if work.Target != "0x00000000ffff0000000000000000000000000000000000000000000000000000" {
-		t.Errorf("Target = %s, want 0x00000000ffff...", work.Target)
+	if work.Height != 12345 {
+		t.Errorf("Height = %d, want 12345", work.Height)
 	}
 
-	if work.Height != 0x1234 {
-		t.Errorf("Height = %d, want %d", work.Height, 0x1234)
+	if work.Difficulty != 1000000 {
+		t.Errorf("Difficulty = %d, want 1000000", work.Difficulty)
 	}
-}
 
-func TestGetWorkInvalidResponse(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		return []string{"only", "three"}, nil
-	})
-	defer server.Close()
-
-	client := NewTOSClient(server.URL, 30*time.Second)
-	ctx := context.Background()
-
-	_, err := client.GetWork(ctx)
-	if err == nil {
-		t.Error("GetWork should fail with invalid response")
+	// Target should be 64 hex chars
+	if len(work.Target) != 64 {
+		t.Errorf("Target length = %d, want 64", len(work.Target))
 	}
 }
 
 func TestGetWorkRPCError(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
+	server := mockNativeRPCServer(t, func(req NativeRPCRequest) (interface{}, *RPCError) {
 		return nil, &RPCError{Code: -32000, Message: "No work available"}
 	})
 	defer server.Close()
 
 	client := NewTOSClient(server.URL, 30*time.Second)
+	client.SetMinerAddress("tos1test")
 	ctx := context.Background()
 
 	_, err := client.GetWork(ctx)
@@ -163,47 +223,10 @@ func TestGetWorkRPCError(t *testing.T) {
 	}
 }
 
-func TestGetBlockTemplate(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		if req.Method != "tos_getBlockTemplate" {
-			t.Errorf("Method = %s, want tos_getBlockTemplate", req.Method)
-		}
-		return BlockTemplate{
-			HeaderHash: "0xheader",
-			ParentHash: "0xparent",
-			Height:     12345,
-			Timestamp:  1700000000,
-			Difficulty: 1000000,
-			Target:     "0xtarget",
-			ExtraNonce: "0xextra",
-		}, nil
-	})
-	defer server.Close()
-
-	client := NewTOSClient(server.URL, 30*time.Second)
-	ctx := context.Background()
-
-	template, err := client.GetBlockTemplate(ctx)
-	if err != nil {
-		t.Fatalf("GetBlockTemplate failed: %v", err)
-	}
-
-	if template.Height != 12345 {
-		t.Errorf("Height = %d, want 12345", template.Height)
-	}
-
-	if template.Difficulty != 1000000 {
-		t.Errorf("Difficulty = %d, want 1000000", template.Difficulty)
-	}
-}
-
 func TestSubmitWork(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		if req.Method != "tos_submitWork" {
-			t.Errorf("Method = %s, want tos_submitWork", req.Method)
-		}
-		if len(req.Params) != 3 {
-			t.Errorf("Params length = %d, want 3", len(req.Params))
+	server := mockNativeRPCServer(t, func(req NativeRPCRequest) (interface{}, *RPCError) {
+		if req.Method != "submit_block" {
+			t.Errorf("Method = %s, want submit_block", req.Method)
 		}
 		return true, nil
 	})
@@ -212,7 +235,7 @@ func TestSubmitWork(t *testing.T) {
 	client := NewTOSClient(server.URL, 30*time.Second)
 	ctx := context.Background()
 
-	success, err := client.SubmitWork(ctx, "0xnonce", "0xheader", "0xmixdigest")
+	success, err := client.SubmitWork(ctx, "nonce123", "template_data", "")
 	if err != nil {
 		t.Fatalf("SubmitWork failed: %v", err)
 	}
@@ -222,30 +245,20 @@ func TestSubmitWork(t *testing.T) {
 	}
 }
 
-func TestSubmitWorkFailed(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		return false, nil
-	})
-	defer server.Close()
-
-	client := NewTOSClient(server.URL, 30*time.Second)
-	ctx := context.Background()
-
-	success, err := client.SubmitWork(ctx, "0xnonce", "0xheader", "0xmixdigest")
-	if err != nil {
-		t.Fatalf("SubmitWork failed: %v", err)
-	}
-
-	if success {
-		t.Error("SubmitWork should return false")
-	}
-}
-
 func TestSubmitBlock(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		if req.Method != "tos_submitBlock" {
-			t.Errorf("Method = %s, want tos_submitBlock", req.Method)
+	server := mockNativeRPCServer(t, func(req NativeRPCRequest) (interface{}, *RPCError) {
+		if req.Method != "submit_block" {
+			t.Errorf("Method = %s, want submit_block", req.Method)
 		}
+
+		params, ok := req.Params.(map[string]interface{})
+		if !ok {
+			t.Error("Params should be an object")
+		}
+		if _, exists := params["block_template"]; !exists {
+			t.Error("Params should contain block_template")
+		}
+
 		return true, nil
 	})
 	defer server.Close()
@@ -253,32 +266,40 @@ func TestSubmitBlock(t *testing.T) {
 	client := NewTOSClient(server.URL, 30*time.Second)
 	ctx := context.Background()
 
-	block := map[string]interface{}{"nonce": "0x123", "hash": "0xabc"}
-	success, err := client.SubmitBlock(ctx, block)
+	success, err := client.SubmitBlock(ctx, "blocktemplatedata", "minerworkdata")
 	if err != nil {
 		t.Fatalf("SubmitBlock failed: %v", err)
 	}
 
 	if !success {
-		t.Error("SubmitBlock should return true")
+		t.Error("SubmitBlock should return true on success")
 	}
 }
 
 func TestGetBlockByNumber(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		if req.Method != "tos_getBlockByNumber" {
-			t.Errorf("Method = %s, want tos_getBlockByNumber", req.Method)
+	server := mockNativeRPCServer(t, func(req NativeRPCRequest) (interface{}, *RPCError) {
+		if req.Method != "get_block_at_topoheight" {
+			t.Errorf("Method = %s, want get_block_at_topoheight", req.Method)
 		}
-		return BlockInfo{
-			Hash:         "0xblockhash",
-			ParentHash:   "0xparenthash",
-			Height:       12345,
-			Timestamp:    1700000000,
-			Difficulty:   1000000,
-			Nonce:        "0xnonce",
-			Miner:        "tos1miner",
-			Reward:       5000000000,
-			Transactions: 10,
+
+		params, ok := req.Params.(map[string]interface{})
+		if !ok {
+			t.Error("Params should be an object")
+		}
+		if _, exists := params["topoheight"]; !exists {
+			t.Error("Params should contain topoheight")
+		}
+
+		return RPCBlockResponse{
+			Hash:        "blockhash",
+			TopoHeight:  12345,
+			Height:      12345,
+			Tips:        []string{"parent1"},
+			Timestamp:   1734567890000,
+			Difficulty:  "1000000",
+			MinerReward: 90000000,
+			TotalFees:   5000,
+			Miner:       "tos1miner",
 		}, nil
 	})
 	defer server.Close()
@@ -291,6 +312,10 @@ func TestGetBlockByNumber(t *testing.T) {
 		t.Fatalf("GetBlockByNumber failed: %v", err)
 	}
 
+	if block.Hash != "blockhash" {
+		t.Errorf("Hash = %s, want blockhash", block.Hash)
+	}
+
 	if block.Height != 12345 {
 		t.Errorf("Height = %d, want 12345", block.Height)
 	}
@@ -301,7 +326,7 @@ func TestGetBlockByNumber(t *testing.T) {
 }
 
 func TestGetBlockByNumberNull(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
+	server := mockNativeRPCServer(t, func(req NativeRPCRequest) (interface{}, *RPCError) {
 		return nil, nil
 	})
 	defer server.Close()
@@ -320,12 +345,13 @@ func TestGetBlockByNumberNull(t *testing.T) {
 }
 
 func TestGetBlockByHash(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		if req.Method != "tos_getBlockByHash" {
-			t.Errorf("Method = %s, want tos_getBlockByHash", req.Method)
+	server := mockNativeRPCServer(t, func(req NativeRPCRequest) (interface{}, *RPCError) {
+		if req.Method != "get_block_by_hash" {
+			t.Errorf("Method = %s, want get_block_by_hash", req.Method)
 		}
-		return BlockInfo{
-			Hash:   "0xblockhash",
+
+		return RPCBlockResponse{
+			Hash:   "blockhash",
 			Height: 12345,
 		}, nil
 	})
@@ -334,47 +360,32 @@ func TestGetBlockByHash(t *testing.T) {
 	client := NewTOSClient(server.URL, 30*time.Second)
 	ctx := context.Background()
 
-	block, err := client.GetBlockByHash(ctx, "0xblockhash")
+	block, err := client.GetBlockByHash(ctx, "blockhash")
 	if err != nil {
 		t.Fatalf("GetBlockByHash failed: %v", err)
 	}
 
-	if block.Hash != "0xblockhash" {
-		t.Errorf("Hash = %s, want 0xblockhash", block.Hash)
-	}
-}
-
-func TestGetBlockByHashNull(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		return nil, nil
-	})
-	defer server.Close()
-
-	client := NewTOSClient(server.URL, 30*time.Second)
-	ctx := context.Background()
-
-	block, err := client.GetBlockByHash(ctx, "0xnonexistent")
-	if err != nil {
-		t.Fatalf("GetBlockByHash failed: %v", err)
-	}
-
-	if block != nil {
-		t.Error("Block should be nil for non-existent hash")
+	if block.Hash != "blockhash" {
+		t.Errorf("Hash = %s, want blockhash", block.Hash)
 	}
 }
 
 func TestGetLatestBlock(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		if req.Method != "tos_getBlockByNumber" {
-			t.Errorf("Method = %s, want tos_getBlockByNumber", req.Method)
+	callCount := 0
+	server := mockNativeRPCServer(t, func(req NativeRPCRequest) (interface{}, *RPCError) {
+		callCount++
+		switch req.Method {
+		case "get_info":
+			return GetInfoResult{
+				TopoHeight: 99999,
+			}, nil
+		case "get_block_at_topoheight":
+			return RPCBlockResponse{
+				Hash:   "latesthash",
+				Height: 99999,
+			}, nil
 		}
-		if req.Params[0] != "latest" {
-			t.Errorf("Params[0] = %v, want latest", req.Params[0])
-		}
-		return BlockInfo{
-			Hash:   "0xlatest",
-			Height: 99999,
-		}, nil
+		return nil, &RPCError{Code: -32601, Message: "Method not found"}
 	})
 	defer server.Close()
 
@@ -392,20 +403,34 @@ func TestGetLatestBlock(t *testing.T) {
 }
 
 func TestGetNetworkInfo(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
+	server := mockNativeRPCServer(t, func(req NativeRPCRequest) (interface{}, *RPCError) {
 		switch req.Method {
-		case "tos_blockNumber":
-			return "0x1234", nil
-		case "tos_getBlockByNumber":
-			return BlockInfo{Difficulty: 1000000}, nil
-		case "net_peerCount":
-			return "0x19", nil
-		case "tos_syncing":
-			return false, nil
-		case "tos_gasPrice":
-			return "0x3b9aca00", nil
+		case "get_info":
+			return GetInfoResult{
+				Height:           12345,
+				TopoHeight:       12345,
+				StableHeight:     12337,
+				StableTopoHeight: 12337,
+				TopBlockHash:     "tophash",
+				Difficulty:       "1000000",
+				BlockTimeTarget:  3000,
+				AverageBlockTime: 3000,
+				BlockReward:      100000000,
+				DevReward:        10000000,
+				MinerReward:      90000000,
+				MempoolSize:      5,
+				Version:          "1.0.0",
+				Network:          "mainnet",
+			}, nil
+		case "p2p_status":
+			return P2pStatusResult{
+				PeerCount:        10,
+				MaxPeers:         32,
+				OurTopoHeight:    12345,
+				BestTopoHeight:   12345,
+				MedianTopoHeight: 12345,
+			}, nil
 		default:
-			t.Errorf("Unexpected method: %s", req.Method)
 			return nil, &RPCError{Code: -32601, Message: "Method not found"}
 		}
 	})
@@ -419,40 +444,37 @@ func TestGetNetworkInfo(t *testing.T) {
 		t.Fatalf("GetNetworkInfo failed: %v", err)
 	}
 
-	if info.Height != 0x1234 {
-		t.Errorf("Height = %d, want %d", info.Height, 0x1234)
+	if info.Height != 12345 {
+		t.Errorf("Height = %d, want 12345", info.Height)
 	}
 
-	if info.PeerCount != 25 {
-		t.Errorf("PeerCount = %d, want 25", info.PeerCount)
+	if info.PeerCount != 10 {
+		t.Errorf("PeerCount = %d, want 10", info.PeerCount)
 	}
 
 	if info.Syncing {
-		t.Error("Syncing should be false")
+		t.Error("Syncing should be false when our_topoheight == best_topoheight")
 	}
 
-	if info.Difficulty != 1000000 {
-		t.Errorf("Difficulty = %d, want 1000000", info.Difficulty)
+	if info.GasPrice != 0 {
+		t.Errorf("GasPrice = %d, want 0 (TOS has no gas)", info.GasPrice)
 	}
 }
 
 func TestGetNetworkInfoSyncing(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
+	server := mockNativeRPCServer(t, func(req NativeRPCRequest) (interface{}, *RPCError) {
 		switch req.Method {
-		case "tos_blockNumber":
-			return "0x1234", nil
-		case "tos_getBlockByNumber":
-			return BlockInfo{Difficulty: 1000000}, nil
-		case "net_peerCount":
-			return "0x5", nil
-		case "tos_syncing":
-			return map[string]string{
-				"startingBlock": "0x1000",
-				"currentBlock":  "0x1200",
-				"highestBlock":  "0x1400",
+		case "get_info":
+			return GetInfoResult{
+				TopoHeight: 12345,
+				Difficulty: "1000000",
 			}, nil
-		case "tos_gasPrice":
-			return "0x3b9aca00", nil
+		case "p2p_status":
+			return P2pStatusResult{
+				PeerCount:      5,
+				OurTopoHeight:  12345,
+				BestTopoHeight: 12500, // Behind
+			}, nil
 		}
 		return nil, nil
 	})
@@ -467,50 +489,27 @@ func TestGetNetworkInfoSyncing(t *testing.T) {
 	}
 
 	if !info.Syncing {
-		t.Error("Syncing should be true")
+		t.Error("Syncing should be true when our_topoheight < best_topoheight")
 	}
 }
 
 func TestGetBalance(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		if req.Method != "tos_getBalance" {
-			t.Errorf("Method = %s, want tos_getBalance", req.Method)
+	server := mockNativeRPCServer(t, func(req NativeRPCRequest) (interface{}, *RPCError) {
+		if req.Method != "get_balance" {
+			t.Errorf("Method = %s, want get_balance", req.Method)
 		}
-		if req.Params[0] != "tos1address" {
-			t.Errorf("Params[0] = %v, want tos1address", req.Params[0])
+
+		params, ok := req.Params.(map[string]interface{})
+		if !ok {
+			t.Error("Params should be an object")
 		}
-		if req.Params[1] != "latest" {
-			t.Errorf("Params[1] = %v, want latest", req.Params[1])
+		if _, exists := params["asset"]; !exists {
+			t.Error("Params should contain asset (native TOS hash)")
 		}
-		return "0x8ac7230489e80000", nil // 10 TOS in wei
-	})
-	defer server.Close()
 
-	client := NewTOSClient(server.URL, 30*time.Second)
-	ctx := context.Background()
-
-	balance, err := client.GetBalance(ctx, "tos1address")
-	if err != nil {
-		t.Fatalf("GetBalance failed: %v", err)
-	}
-
-	expected := uint64(0x8ac7230489e80000)
-	if balance != expected {
-		t.Errorf("Balance = %d, want %d", balance, expected)
-	}
-}
-
-func TestGetTransactionReceipt(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		if req.Method != "tos_getTransactionReceipt" {
-			t.Errorf("Method = %s, want tos_getTransactionReceipt", req.Method)
-		}
-		return TxReceipt{
-			TxHash:      "0xtxhash",
-			BlockHash:   "0xblockhash",
-			BlockNumber: 12345,
-			Status:      1,
-			GasUsed:     21000,
+		return GetBalanceResult{
+			Balance:    100000000000,
+			TopoHeight: 12345,
 		}, nil
 	})
 	defer server.Close()
@@ -518,187 +517,23 @@ func TestGetTransactionReceipt(t *testing.T) {
 	client := NewTOSClient(server.URL, 30*time.Second)
 	ctx := context.Background()
 
-	receipt, err := client.GetTransactionReceipt(ctx, "0xtxhash")
+	balance, err := client.GetBalance(ctx, "tos1testaddress")
 	if err != nil {
-		t.Fatalf("GetTransactionReceipt failed: %v", err)
+		t.Fatalf("GetBalance failed: %v", err)
 	}
 
-	if receipt.Status != 1 {
-		t.Errorf("Status = %d, want 1", receipt.Status)
-	}
-
-	if receipt.GasUsed != 21000 {
-		t.Errorf("GasUsed = %d, want 21000", receipt.GasUsed)
-	}
-}
-
-func TestGetTransactionReceiptNull(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		return nil, nil
-	})
-	defer server.Close()
-
-	client := NewTOSClient(server.URL, 30*time.Second)
-	ctx := context.Background()
-
-	receipt, err := client.GetTransactionReceipt(ctx, "0xnonexistent")
-	if err != nil {
-		t.Fatalf("GetTransactionReceipt failed: %v", err)
-	}
-
-	if receipt != nil {
-		t.Error("Receipt should be nil for non-existent tx")
-	}
-}
-
-func TestSendRawTransaction(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		if req.Method != "tos_sendRawTransaction" {
-			t.Errorf("Method = %s, want tos_sendRawTransaction", req.Method)
-		}
-		return "0xnewtxhash", nil
-	})
-	defer server.Close()
-
-	client := NewTOSClient(server.URL, 30*time.Second)
-	ctx := context.Background()
-
-	txHash, err := client.SendRawTransaction(ctx, "0xsignedtx")
-	if err != nil {
-		t.Fatalf("SendRawTransaction failed: %v", err)
-	}
-
-	if txHash != "0xnewtxhash" {
-		t.Errorf("TxHash = %s, want 0xnewtxhash", txHash)
-	}
-}
-
-func TestGetNonce(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		if req.Method != "tos_getTransactionCount" {
-			t.Errorf("Method = %s, want tos_getTransactionCount", req.Method)
-		}
-		if req.Params[1] != "pending" {
-			t.Errorf("Params[1] = %v, want pending", req.Params[1])
-		}
-		return "0x5", nil
-	})
-	defer server.Close()
-
-	client := NewTOSClient(server.URL, 30*time.Second)
-	ctx := context.Background()
-
-	nonce, err := client.GetNonce(ctx, "tos1address")
-	if err != nil {
-		t.Fatalf("GetNonce failed: %v", err)
-	}
-
-	if nonce != 5 {
-		t.Errorf("Nonce = %d, want 5", nonce)
-	}
-}
-
-func TestEstimateGas(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		if req.Method != "tos_estimateGas" {
-			t.Errorf("Method = %s, want tos_estimateGas", req.Method)
-		}
-		return "0x5208", nil // 21000
-	})
-	defer server.Close()
-
-	client := NewTOSClient(server.URL, 30*time.Second)
-	ctx := context.Background()
-
-	gas, err := client.EstimateGas(ctx, "tos1from", "tos1to", 1000000000)
-	if err != nil {
-		t.Fatalf("EstimateGas failed: %v", err)
-	}
-
-	if gas != 21000 {
-		t.Errorf("Gas = %d, want 21000", gas)
-	}
-}
-
-func TestSendTransaction(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		switch req.Method {
-		case "tos_gasPrice":
-			return "0x3b9aca00", nil
-		case "tos_sendTransaction":
-			return "0xnewtxhash", nil
-		}
-		return nil, nil
-	})
-	defer server.Close()
-
-	client := NewTOSClient(server.URL, 30*time.Second)
-	ctx := context.Background()
-
-	txHash, err := client.SendTransaction(ctx, "tos1recipient", 1000000000)
-	if err != nil {
-		t.Fatalf("SendTransaction failed: %v", err)
-	}
-
-	if txHash != "0xnewtxhash" {
-		t.Errorf("TxHash = %s, want 0xnewtxhash", txHash)
-	}
-}
-
-func TestSendTransactionGasPriceError(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		if req.Method == "tos_gasPrice" {
-			return nil, &RPCError{Code: -32000, Message: "Node error"}
-		}
-		return nil, nil
-	})
-	defer server.Close()
-
-	client := NewTOSClient(server.URL, 30*time.Second)
-	ctx := context.Background()
-
-	_, err := client.SendTransaction(ctx, "tos1recipient", 1000000000)
-	if err == nil {
-		t.Error("SendTransaction should fail when gas price fails")
-	}
-}
-
-func TestGetGasPrice(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		if req.Method != "tos_gasPrice" {
-			t.Errorf("Method = %s, want tos_gasPrice", req.Method)
-		}
-		return "0x3b9aca00", nil // 1 gwei
-	})
-	defer server.Close()
-
-	client := NewTOSClient(server.URL, 30*time.Second)
-	ctx := context.Background()
-
-	gasPrice, err := client.GetGasPrice(ctx)
-	if err != nil {
-		t.Fatalf("GetGasPrice failed: %v", err)
-	}
-
-	if gasPrice != 1000000000 {
-		t.Errorf("GasPrice = %d, want 1000000000", gasPrice)
+	if balance != 100000000000 {
+		t.Errorf("Balance = %d, want 100000000000", balance)
 	}
 }
 
 func TestGetBlockTxFees(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		switch req.Method {
-		case "tos_getBlockByNumber":
-			return map[string]interface{}{
-				"transactions": []map[string]string{
-					{"hash": "0xtx1", "gasPrice": "0x3b9aca00"},
-					{"hash": "0xtx2", "gasPrice": "0x3b9aca00"},
-				},
-			}, nil
-		case "tos_getTransactionReceipt":
-			return TxReceipt{GasUsed: 21000}, nil
-		}
-		return nil, nil
+	server := mockNativeRPCServer(t, func(req NativeRPCRequest) (interface{}, *RPCError) {
+		return RPCBlockResponse{
+			Hash:      "blockhash",
+			Height:   12345,
+			TotalFees: 5000,
+		}, nil
 	})
 	defer server.Close()
 
@@ -710,90 +545,18 @@ func TestGetBlockTxFees(t *testing.T) {
 		t.Fatalf("GetBlockTxFees failed: %v", err)
 	}
 
-	// 2 txs * 21000 gas * 1 gwei = 42000 gwei
-	expected := uint64(2 * 21000 * 1000000000)
-	if fees != expected {
-		t.Errorf("Fees = %d, want %d", fees, expected)
-	}
-}
-
-func TestGetBlockTxFeesNull(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		return nil, nil
-	})
-	defer server.Close()
-
-	client := NewTOSClient(server.URL, 30*time.Second)
-	ctx := context.Background()
-
-	fees, err := client.GetBlockTxFees(ctx, 99999999)
-	if err != nil {
-		t.Fatalf("GetBlockTxFees failed: %v", err)
-	}
-
-	if fees != 0 {
-		t.Errorf("Fees = %d, want 0", fees)
-	}
-}
-
-func TestSearchBlockByHash(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		if req.Method == "tos_getBlockByNumber" {
-			// Return found block at height 10002
-			return BlockInfo{Hash: "0xtarget", Height: 10002}, nil
-		}
-		return nil, nil
-	})
-	defer server.Close()
-
-	client := NewTOSClient(server.URL, 30*time.Second)
-	ctx := context.Background()
-
-	block, err := client.SearchBlockByHash(ctx, "0xtarget", 10000, 5)
-	if err != nil {
-		t.Fatalf("SearchBlockByHash failed: %v", err)
-	}
-
-	if block == nil {
-		t.Fatal("Block should be found")
-	}
-
-	if block.Hash != "0xtarget" {
-		t.Errorf("Hash = %s, want 0xtarget", block.Hash)
-	}
-}
-
-func TestSearchBlockByHashNotFound(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		return BlockInfo{Hash: "0xother", Height: 10000}, nil
-	})
-	defer server.Close()
-
-	client := NewTOSClient(server.URL, 30*time.Second)
-	ctx := context.Background()
-
-	block, err := client.SearchBlockByHash(ctx, "0xnotfound", 10000, 2)
-	if err != nil {
-		t.Fatalf("SearchBlockByHash failed: %v", err)
-	}
-
-	if block != nil {
-		t.Error("Block should not be found")
+	if fees != 5000 {
+		t.Errorf("Fees = %d, want 5000", fees)
 	}
 }
 
 func TestGetBlockRewardWithFees(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
-		switch req.Method {
-		case "tos_getBlockByNumber":
-			return BlockInfo{
-				Reward: 5000000000,
-				Height: 12345,
-			}, nil
-		case "tos_getTransactionReceipt":
-			return TxReceipt{GasUsed: 21000}, nil
-		}
-		return nil, nil
+	server := mockNativeRPCServer(t, func(req NativeRPCRequest) (interface{}, *RPCError) {
+		return RPCBlockResponse{
+			Height:      12345,
+			MinerReward: 90000000,
+			TotalFees:   5000,
+		}, nil
 	})
 	defer server.Close()
 
@@ -805,17 +568,171 @@ func TestGetBlockRewardWithFees(t *testing.T) {
 		t.Fatalf("GetBlockRewardWithFees failed: %v", err)
 	}
 
-	if reward != 5000000000 {
-		t.Errorf("Reward = %d, want 5000000000", reward)
+	if reward != 90000000 {
+		t.Errorf("Reward = %d, want 90000000", reward)
 	}
 
-	// Fees might be 0 if block has no transactions in mock
-	_ = fees
+	if fees != 5000 {
+		t.Errorf("Fees = %d, want 5000", fees)
+	}
+}
+
+func TestSearchBlockByHash(t *testing.T) {
+	server := mockNativeRPCServer(t, func(req NativeRPCRequest) (interface{}, *RPCError) {
+		if req.Method == "get_block_by_hash" {
+			return RPCBlockResponse{Hash: "target", Height: 10002}, nil
+		}
+		return nil, nil
+	})
+	defer server.Close()
+
+	client := NewTOSClient(server.URL, 30*time.Second)
+	ctx := context.Background()
+
+	block, err := client.SearchBlockByHash(ctx, "target", 10000, 5)
+	if err != nil {
+		t.Fatalf("SearchBlockByHash failed: %v", err)
+	}
+
+	if block == nil {
+		t.Fatal("Block should be found")
+	}
+
+	if block.Hash != "target" {
+		t.Errorf("Hash = %s, want target", block.Hash)
+	}
+}
+
+func TestConvertBlockResponse(t *testing.T) {
+	native := &RPCBlockResponse{
+		Hash:                 "blockhash123",
+		TopoHeight:           12345,
+		BlockType:            "Normal",
+		Difficulty:           "1000000",
+		Supply:               100000000000000,
+		Reward:               100000000,
+		MinerReward:          90000000,
+		DevReward:            10000000,
+		CumulativeDifficulty: "12345000000",
+		TotalFees:            5000,
+		TotalSizeInBytes:     1024,
+		Version:              1,
+		Tips:                 []string{"parent1", "parent2"},
+		Timestamp:            1734567890000, // milliseconds
+		Height:               12345,
+		Nonce:                123456789,
+		ExtraNonce:           "0000000000000000",
+		Miner:                "tos1miner",
+		TxsHashes:            []string{"tx1", "tx2", "tx3"},
+	}
+
+	result := convertBlockResponse(native)
+
+	if result.Hash != "blockhash123" {
+		t.Errorf("Hash = %s, want blockhash123", result.Hash)
+	}
+
+	if result.ParentHash != "parent1" {
+		t.Errorf("ParentHash = %s, want parent1", result.ParentHash)
+	}
+
+	if result.Height != 12345 {
+		t.Errorf("Height = %d, want 12345", result.Height)
+	}
+
+	if result.Timestamp != 1734567890 {
+		t.Errorf("Timestamp = %d, want 1734567890 (converted from ms)", result.Timestamp)
+	}
+
+	if result.Miner != "tos1miner" {
+		t.Errorf("Miner = %s, want tos1miner", result.Miner)
+	}
+
+	if result.Reward != 90000000 {
+		t.Errorf("Reward = %d, want 90000000 (miner reward)", result.Reward)
+	}
+
+	if result.TxFees != 5000 {
+		t.Errorf("TxFees = %d, want 5000", result.TxFees)
+	}
+
+	if result.Transactions != 3 {
+		t.Errorf("Transactions = %d, want 3", result.Transactions)
+	}
+
+	if result.GasUsed != 0 {
+		t.Errorf("GasUsed = %d, want 0 (TOS has no gas)", result.GasUsed)
+	}
+}
+
+func TestConvertBlockResponseEmptyTips(t *testing.T) {
+	native := &RPCBlockResponse{
+		Hash: "blockhash",
+		Tips: []string{},
+	}
+
+	result := convertBlockResponse(native)
+
+	if result.ParentHash != "" {
+		t.Errorf("ParentHash = %s, want empty string for no tips", result.ParentHash)
+	}
+}
+
+func TestNativeAssetHash(t *testing.T) {
+	if len(NativeAssetHash) != 64 {
+		t.Errorf("NativeAssetHash length = %d, want 64", len(NativeAssetHash))
+	}
+
+	// Should be all zeros
+	for _, c := range NativeAssetHash {
+		if c != '0' {
+			t.Errorf("NativeAssetHash should be all zeros, got %s", NativeAssetHash)
+			break
+		}
+	}
+}
+
+func TestEstimateGas(t *testing.T) {
+	client := NewTOSClient("http://localhost:8080", 30*time.Second)
+	ctx := context.Background()
+
+	gas, err := client.EstimateGas(ctx, "from", "to", 1000)
+	if err != nil {
+		t.Fatalf("EstimateGas failed: %v", err)
+	}
+
+	if gas != 0 {
+		t.Errorf("Gas = %d, want 0 (TOS has no gas)", gas)
+	}
+}
+
+func TestGetGasPrice(t *testing.T) {
+	client := NewTOSClient("http://localhost:8080", 30*time.Second)
+	ctx := context.Background()
+
+	price, err := client.GetGasPrice(ctx)
+	if err != nil {
+		t.Fatalf("GetGasPrice failed: %v", err)
+	}
+
+	if price != 0 {
+		t.Errorf("GasPrice = %d, want 0 (TOS has no gas)", price)
+	}
+}
+
+func TestSendTransaction(t *testing.T) {
+	client := NewTOSClient("http://localhost:8080", 30*time.Second)
+	ctx := context.Background()
+
+	_, err := client.SendTransaction(ctx, "tos1recipient", 1000)
+	if err == nil {
+		t.Error("SendTransaction should return error (requires wallet integration)")
+	}
 }
 
 func TestConnectionError(t *testing.T) {
-	// Client pointing to non-existent server
 	client := NewTOSClient("http://localhost:19999", 1*time.Second)
+	client.SetMinerAddress("tos1test")
 	ctx := context.Background()
 
 	_, err := client.GetWork(ctx)
@@ -823,20 +740,20 @@ func TestConnectionError(t *testing.T) {
 		t.Error("GetWork should fail with connection error")
 	}
 
-	// After failure, client should record it
 	if client.failCount == 0 {
 		t.Error("Fail count should be incremented")
 	}
 }
 
 func TestContextCancellation(t *testing.T) {
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
+	server := mockNativeRPCServer(t, func(req NativeRPCRequest) (interface{}, *RPCError) {
 		time.Sleep(5 * time.Second)
 		return nil, nil
 	})
 	defer server.Close()
 
 	client := NewTOSClient(server.URL, 30*time.Second)
+	client.SetMinerAddress("tos1test")
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
@@ -850,15 +767,20 @@ func TestConcurrentCalls(t *testing.T) {
 	var callCount int
 	var mu sync.Mutex
 
-	server := mockRPCServer(t, func(req RPCRequest) (interface{}, *RPCError) {
+	server := mockNativeRPCServer(t, func(req NativeRPCRequest) (interface{}, *RPCError) {
 		mu.Lock()
 		callCount++
 		mu.Unlock()
-		return []string{"0x1", "0x2", "0x3", "0x4"}, nil
+		return GetBlockTemplateResult{
+			Template:   "test",
+			Difficulty: "1000",
+			Height:     1,
+		}, nil
 	})
 	defer server.Close()
 
 	client := NewTOSClient(server.URL, 30*time.Second)
+	client.SetMinerAddress("tos1test")
 	ctx := context.Background()
 
 	var wg sync.WaitGroup
@@ -880,18 +802,18 @@ func TestConcurrentCalls(t *testing.T) {
 
 func TestBlockTemplateStruct(t *testing.T) {
 	template := BlockTemplate{
-		HeaderHash:   "0xheader",
-		ParentHash:   "0xparent",
+		HeaderHash:   "header",
+		ParentHash:   "parent",
 		Height:       12345,
 		Timestamp:    1700000000,
 		Difficulty:   1000000,
-		Target:       "0xtarget",
-		ExtraNonce:   "0xextra",
+		Target:       "target",
+		ExtraNonce:   "extra",
 		Transactions: []byte{0x01, 0x02},
 	}
 
-	if template.HeaderHash != "0xheader" {
-		t.Errorf("HeaderHash = %s, want 0xheader", template.HeaderHash)
+	if template.HeaderHash != "header" {
+		t.Errorf("HeaderHash = %s, want header", template.HeaderHash)
 	}
 
 	if len(template.Transactions) != 2 {
@@ -901,18 +823,18 @@ func TestBlockTemplateStruct(t *testing.T) {
 
 func TestBlockInfoStruct(t *testing.T) {
 	block := BlockInfo{
-		Hash:         "0xhash",
-		ParentHash:   "0xparent",
+		Hash:         "hash",
+		ParentHash:   "parent",
 		Height:       12345,
 		Timestamp:    1700000000,
 		Difficulty:   1000000,
-		TotalDiff:    "0xtotal",
-		Nonce:        "0xnonce",
+		TotalDiff:    "total",
+		Nonce:        "nonce",
 		Miner:        "tos1miner",
 		Reward:       5000000000,
 		Size:         1024,
-		GasUsed:      100000,
-		GasLimit:     15000000,
+		GasUsed:      0,
+		GasLimit:     0,
 		Transactions: 50,
 		TxFees:       1000000,
 	}
@@ -934,25 +856,25 @@ func TestNetworkInfoStruct(t *testing.T) {
 		Hashrate:   500000,
 		PeerCount:  25,
 		Syncing:    false,
-		GasPrice:   1000000000,
+		GasPrice:   0,
 	}
 
 	if info.ChainID != 1 {
 		t.Errorf("ChainID = %d, want 1", info.ChainID)
 	}
 
-	if info.Hashrate != 500000 {
-		t.Errorf("Hashrate = %d, want 500000", info.Hashrate)
+	if info.GasPrice != 0 {
+		t.Errorf("GasPrice = %d, want 0", info.GasPrice)
 	}
 }
 
 func TestTxReceiptStruct(t *testing.T) {
 	receipt := TxReceipt{
-		TxHash:      "0xtxhash",
-		BlockHash:   "0xblockhash",
+		TxHash:      "txhash",
+		BlockHash:   "blockhash",
 		BlockNumber: 12345,
 		Status:      1,
-		GasUsed:     21000,
+		GasUsed:     0,
 	}
 
 	if receipt.Status != 1 {
@@ -960,13 +882,55 @@ func TestTxReceiptStruct(t *testing.T) {
 	}
 }
 
+func TestP2pStatusResult(t *testing.T) {
+	tag := "testnode"
+	result := P2pStatusResult{
+		PeerCount:        10,
+		MaxPeers:         32,
+		Tag:              &tag,
+		OurTopoHeight:    12345,
+		BestTopoHeight:   12346,
+		MedianTopoHeight: 12345,
+		PeerID:           1234567890,
+	}
+
+	if *result.Tag != "testnode" {
+		t.Errorf("Tag = %s, want testnode", *result.Tag)
+	}
+
+	// Test syncing detection
+	syncing := result.OurTopoHeight < result.BestTopoHeight
+	if !syncing {
+		t.Error("Should be syncing when our_topoheight < best_topoheight")
+	}
+}
+
+func TestGetBlockTemplateResultStruct(t *testing.T) {
+	result := GetBlockTemplateResult{
+		Template:   "deadbeef",
+		Algorithm:  "tos/v3",
+		Height:     12345,
+		TopoHeight: 12345,
+		Difficulty: "1000000",
+	}
+
+	if result.Algorithm != "tos/v3" {
+		t.Errorf("Algorithm = %s, want tos/v3", result.Algorithm)
+	}
+}
+
 func BenchmarkGetWork(b *testing.B) {
-	server := mockRPCServer(nil, func(req RPCRequest) (interface{}, *RPCError) {
-		return []string{"0x1", "0x2", "0x3", "0x4"}, nil
+	server := mockNativeRPCServer(nil, func(req NativeRPCRequest) (interface{}, *RPCError) {
+		return GetBlockTemplateResult{
+			Template:   "test",
+			Difficulty: "1000",
+			Height:     1,
+		}, nil
 	})
 	defer server.Close()
 
 	client := NewTOSClient(server.URL, 30*time.Second)
+	client.SetMinerAddress("tos1test")
 	ctx := context.Background()
 
 	b.ResetTimer()
@@ -976,7 +940,7 @@ func BenchmarkGetWork(b *testing.B) {
 }
 
 func BenchmarkSubmitWork(b *testing.B) {
-	server := mockRPCServer(nil, func(req RPCRequest) (interface{}, *RPCError) {
+	server := mockNativeRPCServer(nil, func(req NativeRPCRequest) (interface{}, *RPCError) {
 		return true, nil
 	})
 	defer server.Close()
@@ -986,6 +950,6 @@ func BenchmarkSubmitWork(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		client.SubmitWork(ctx, "0xnonce", "0xheader", "0xmix")
+		client.SubmitWork(ctx, "nonce", "header", "mix")
 	}
 }

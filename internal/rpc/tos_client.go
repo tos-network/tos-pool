@@ -1,4 +1,4 @@
-// Package rpc provides TOS node communication.
+// Package rpc provides TOS node communication using native TOS daemon API.
 package rpc
 
 import (
@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,12 +17,16 @@ import (
 	"github.com/tos-network/tos-pool/internal/util"
 )
 
-// TOSClient handles communication with a TOS node
+// NativeAssetHash is the asset hash for native TOS token (64 zeros)
+const NativeAssetHash = "0000000000000000000000000000000000000000000000000000000000000000"
+
+// TOSClient handles communication with a TOS node using native TOS daemon API
 type TOSClient struct {
-	url       string
-	timeout   time.Duration
-	client    *http.Client
-	requestID uint64
+	url          string
+	timeout      time.Duration
+	client       *http.Client
+	requestID    uint64
+	minerAddress string // Address for get_block_template
 
 	// Health tracking
 	mu           sync.RWMutex
@@ -42,12 +48,19 @@ func NewTOSClient(url string, timeout time.Duration) *TOSClient {
 	}
 }
 
-// RPCRequest represents a JSON-RPC request
-type RPCRequest struct {
-	JSONRPC string        `json:"jsonrpc"`
-	Method  string        `json:"method"`
-	Params  []interface{} `json:"params,omitempty"`
-	ID      uint64        `json:"id"`
+// SetMinerAddress sets the miner address for get_block_template calls
+func (c *TOSClient) SetMinerAddress(address string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.minerAddress = address
+}
+
+// NativeRPCRequest represents a TOS native JSON-RPC request with object params
+type NativeRPCRequest struct {
+	JSONRPC string      `json:"jsonrpc"`
+	Method  string      `json:"method"`
+	Params  interface{} `json:"params,omitempty"` // Can be object or nil
+	ID      uint64      `json:"id"`
 }
 
 // RPCResponse represents a JSON-RPC response
@@ -95,18 +108,18 @@ type BlockInfo struct {
 	GasUsed      uint64 `json:"gasUsed"`
 	GasLimit     uint64 `json:"gasLimit"`
 	Transactions int    `json:"transactionCount"`
-	TxFees       uint64 `json:"txFees"` // Total transaction fees in block
+	TxFees       uint64 `json:"txFees"`
 }
 
 // NetworkInfo represents network statistics
 type NetworkInfo struct {
-	ChainID     uint64 `json:"chainId"`
-	Height      uint64 `json:"height"`
-	Difficulty  uint64 `json:"difficulty"`
-	Hashrate    uint64 `json:"hashrate"`
-	PeerCount   int    `json:"peerCount"`
-	Syncing     bool   `json:"syncing"`
-	GasPrice    uint64 `json:"gasPrice"`
+	ChainID    uint64 `json:"chainId"`
+	Height     uint64 `json:"height"`
+	Difficulty uint64 `json:"difficulty"`
+	Hashrate   uint64 `json:"hashrate"`
+	PeerCount  int    `json:"peerCount"`
+	Syncing    bool   `json:"syncing"`
+	GasPrice   uint64 `json:"gasPrice"` // Always 0 for TOS (no gas)
 }
 
 // TxReceipt represents a transaction receipt
@@ -118,11 +131,80 @@ type TxReceipt struct {
 	GasUsed     uint64 `json:"gasUsed"`
 }
 
-// call makes an RPC call
-func (c *TOSClient) call(ctx context.Context, method string, params ...interface{}) (json.RawMessage, error) {
+// === TOS Native API Response Structures ===
+
+// GetBlockTemplateResult represents get_block_template response
+type GetBlockTemplateResult struct {
+	Template   string `json:"template"`
+	Algorithm  string `json:"algorithm"`
+	Height     uint64 `json:"height"`
+	TopoHeight uint64 `json:"topoheight"`
+	Difficulty string `json:"difficulty"`
+}
+
+// GetInfoResult represents get_info response
+type GetInfoResult struct {
+	Height           uint64 `json:"height"`
+	TopoHeight       uint64 `json:"topoheight"`
+	StableHeight     uint64 `json:"stableheight"`
+	StableTopoHeight uint64 `json:"stable_topoheight"`
+	TopBlockHash     string `json:"top_block_hash"`
+	Difficulty       string `json:"difficulty"`
+	BlockTimeTarget  uint64 `json:"block_time_target"`
+	AverageBlockTime uint64 `json:"average_block_time"`
+	BlockReward      uint64 `json:"block_reward"`
+	DevReward        uint64 `json:"dev_reward"`
+	MinerReward      uint64 `json:"miner_reward"`
+	MempoolSize      uint64 `json:"mempool_size"`
+	Version          string `json:"version"`
+	Network          string `json:"network"`
+}
+
+// P2pStatusResult represents p2p_status response
+type P2pStatusResult struct {
+	PeerCount        uint64  `json:"peer_count"`
+	MaxPeers         uint64  `json:"max_peers"`
+	Tag              *string `json:"tag"`
+	OurTopoHeight    uint64  `json:"our_topoheight"`
+	BestTopoHeight   uint64  `json:"best_topoheight"`
+	MedianTopoHeight uint64  `json:"median_topoheight"`
+	PeerID           uint64  `json:"peer_id"`
+}
+
+// RPCBlockResponse represents get_block_at_topoheight/get_block_by_hash response
+type RPCBlockResponse struct {
+	Hash                 string   `json:"hash"`
+	TopoHeight           uint64   `json:"topoheight"`
+	BlockType            string   `json:"block_type"`
+	Difficulty           string   `json:"difficulty"`
+	Supply               uint64   `json:"supply"`
+	Reward               uint64   `json:"reward"`
+	MinerReward          uint64   `json:"miner_reward"`
+	DevReward            uint64   `json:"dev_reward"`
+	CumulativeDifficulty string   `json:"cumulative_difficulty"`
+	TotalFees            uint64   `json:"total_fees"`
+	TotalSizeInBytes     uint64   `json:"total_size_in_bytes"`
+	Version              uint64   `json:"version"`
+	Tips                 []string `json:"tips"`
+	Timestamp            uint64   `json:"timestamp"`
+	Height               uint64   `json:"height"`
+	Nonce                uint64   `json:"nonce"`
+	ExtraNonce           string   `json:"extra_nonce"`
+	Miner                string   `json:"miner"`
+	TxsHashes            []string `json:"txs_hashes"`
+}
+
+// GetBalanceResult represents get_balance response
+type GetBalanceResult struct {
+	Balance    uint64 `json:"balance"`
+	TopoHeight uint64 `json:"topoheight"`
+}
+
+// call makes an RPC call using TOS native format (object params)
+func (c *TOSClient) call(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
 	id := atomic.AddUint64(&c.requestID, 1)
 
-	req := RPCRequest{
+	req := NativeRPCRequest{
 		JSONRPC: "2.0",
 		Method:  method,
 		Params:  params,
@@ -197,81 +279,131 @@ func (c *TOSClient) IsHealthy() bool {
 	return c.healthy
 }
 
-// GetWork returns the current mining work
+// parseDifficulty converts string difficulty to uint64
+func parseDifficulty(diff string) uint64 {
+	val, err := strconv.ParseUint(diff, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return val
+}
+
+// difficultyToTarget converts difficulty to target hex string
+// Target = MaxTarget / Difficulty
+func difficultyToTarget(difficulty string) string {
+	diff, err := strconv.ParseUint(difficulty, 10, 64)
+	if err != nil || diff == 0 {
+		// Return max target if difficulty is invalid
+		return "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	}
+
+	// MaxTarget = 2^256 - 1
+	maxTarget := new(big.Int)
+	maxTarget.SetString("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 16)
+
+	// Target = MaxTarget / Difficulty
+	diffBig := new(big.Int).SetUint64(diff)
+	target := new(big.Int).Div(maxTarget, diffBig)
+
+	// Convert to 64-char hex string (32 bytes, left-padded)
+	return fmt.Sprintf("%064x", target)
+}
+
+// GetWork returns the current mining work using get_block_template
 func (c *TOSClient) GetWork(ctx context.Context) (*BlockTemplate, error) {
-	result, err := c.call(ctx, "tos_getWork")
+	c.mu.RLock()
+	minerAddr := c.minerAddress
+	c.mu.RUnlock()
+
+	params := map[string]interface{}{
+		"address": minerAddr,
+	}
+
+	result, err := c.call(ctx, "get_block_template", params)
 	if err != nil {
 		return nil, err
 	}
 
-	// GetWork returns [headerHash, seedHash, target, height]
-	var work []string
-	if err := json.Unmarshal(result, &work); err != nil {
-		return nil, err
+	var templateResult GetBlockTemplateResult
+	if err := json.Unmarshal(result, &templateResult); err != nil {
+		return nil, fmt.Errorf("failed to parse block template: %w", err)
 	}
-
-	if len(work) < 4 {
-		return nil, fmt.Errorf("invalid work response")
-	}
-
-	height := uint64(0)
-	fmt.Sscanf(work[3], "0x%x", &height)
 
 	return &BlockTemplate{
-		HeaderHash: work[0],
-		Target:     work[2],
-		Height:     height,
+		HeaderHash: templateResult.Template,
+		Height:     templateResult.Height,
+		Difficulty: parseDifficulty(templateResult.Difficulty),
+		Target:     difficultyToTarget(templateResult.Difficulty),
 	}, nil
 }
 
-// GetBlockTemplate returns a full block template
+// GetBlockTemplate returns a full block template (alias for GetWork)
 func (c *TOSClient) GetBlockTemplate(ctx context.Context) (*BlockTemplate, error) {
-	result, err := c.call(ctx, "tos_getBlockTemplate")
-	if err != nil {
-		return nil, err
-	}
-
-	var template BlockTemplate
-	if err := json.Unmarshal(result, &template); err != nil {
-		return nil, err
-	}
-
-	return &template, nil
+	return c.GetWork(ctx)
 }
 
-// SubmitWork submits a mined block
+// SubmitWork submits a mined block using submit_block
 func (c *TOSClient) SubmitWork(ctx context.Context, nonce, headerHash, mixDigest string) (bool, error) {
-	result, err := c.call(ctx, "tos_submitWork", nonce, headerHash, mixDigest)
-	if err != nil {
-		return false, err
-	}
-
-	var success bool
-	if err := json.Unmarshal(result, &success); err != nil {
-		return false, err
-	}
-
-	return success, nil
+	// For TOS, we submit the block template with nonce embedded
+	// The headerHash contains the template, mixDigest is unused in TOS
+	return c.SubmitBlock(ctx, headerHash, nonce)
 }
 
 // SubmitBlock submits a complete block
-func (c *TOSClient) SubmitBlock(ctx context.Context, block interface{}) (bool, error) {
-	result, err := c.call(ctx, "tos_submitBlock", block)
+func (c *TOSClient) SubmitBlock(ctx context.Context, blockTemplate string, minerWork string) (bool, error) {
+	params := map[string]interface{}{
+		"block_template": blockTemplate,
+	}
+	if minerWork != "" {
+		params["miner_work"] = minerWork
+	}
+
+	result, err := c.call(ctx, "submit_block", params)
 	if err != nil {
 		return false, err
 	}
 
 	var success bool
 	if err := json.Unmarshal(result, &success); err != nil {
-		return false, err
+		// Some implementations return the block hash on success
+		return result != nil && string(result) != "null", nil
 	}
 
 	return success, nil
 }
 
-// GetBlockByNumber returns block by number
+// convertBlockResponse converts TOS native block response to BlockInfo
+func convertBlockResponse(native *RPCBlockResponse) *BlockInfo {
+	parentHash := ""
+	if len(native.Tips) > 0 {
+		parentHash = native.Tips[0]
+	}
+
+	return &BlockInfo{
+		Hash:         native.Hash,
+		ParentHash:   parentHash,
+		Height:       native.Height,
+		Timestamp:    native.Timestamp / 1000, // Convert ms to seconds
+		Difficulty:   parseDifficulty(native.Difficulty),
+		TotalDiff:    native.CumulativeDifficulty,
+		Nonce:        fmt.Sprintf("%d", native.Nonce),
+		Miner:        native.Miner,
+		Reward:       native.MinerReward,
+		Size:         native.TotalSizeInBytes,
+		GasUsed:      0, // TOS has no gas
+		GasLimit:     0,
+		Transactions: len(native.TxsHashes),
+		TxFees:       native.TotalFees,
+	}
+}
+
+// GetBlockByNumber returns block by topoheight using get_block_at_topoheight
 func (c *TOSClient) GetBlockByNumber(ctx context.Context, number uint64) (*BlockInfo, error) {
-	result, err := c.call(ctx, "tos_getBlockByNumber", fmt.Sprintf("0x%x", number), true)
+	params := map[string]interface{}{
+		"topoheight": number,
+	}
+
+	result, err := c.call(ctx, "get_block_at_topoheight", params)
 	if err != nil {
 		return nil, err
 	}
@@ -280,17 +412,21 @@ func (c *TOSClient) GetBlockByNumber(ctx context.Context, number uint64) (*Block
 		return nil, nil
 	}
 
-	var block BlockInfo
-	if err := json.Unmarshal(result, &block); err != nil {
+	var blockResp RPCBlockResponse
+	if err := json.Unmarshal(result, &blockResp); err != nil {
 		return nil, err
 	}
 
-	return &block, nil
+	return convertBlockResponse(&blockResp), nil
 }
 
-// GetBlockByHash returns block by hash
+// GetBlockByHash returns block by hash using get_block_by_hash
 func (c *TOSClient) GetBlockByHash(ctx context.Context, hash string) (*BlockInfo, error) {
-	result, err := c.call(ctx, "tos_getBlockByHash", hash, true)
+	params := map[string]interface{}{
+		"hash": hash,
+	}
+
+	result, err := c.call(ctx, "get_block_by_hash", params)
 	if err != nil {
 		return nil, err
 	}
@@ -299,101 +435,95 @@ func (c *TOSClient) GetBlockByHash(ctx context.Context, hash string) (*BlockInfo
 		return nil, nil
 	}
 
-	var block BlockInfo
-	if err := json.Unmarshal(result, &block); err != nil {
+	var blockResp RPCBlockResponse
+	if err := json.Unmarshal(result, &blockResp); err != nil {
 		return nil, err
 	}
 
-	return &block, nil
+	return convertBlockResponse(&blockResp), nil
 }
 
-// GetLatestBlock returns the latest block
+// GetLatestBlock returns the latest block using get_info + get_block_at_topoheight
 func (c *TOSClient) GetLatestBlock(ctx context.Context) (*BlockInfo, error) {
-	result, err := c.call(ctx, "tos_getBlockByNumber", "latest", true)
+	// First get current topoheight
+	result, err := c.call(ctx, "get_info", nil)
 	if err != nil {
 		return nil, err
 	}
 
-	var block BlockInfo
-	if err := json.Unmarshal(result, &block); err != nil {
+	var info GetInfoResult
+	if err := json.Unmarshal(result, &info); err != nil {
 		return nil, err
 	}
 
-	return &block, nil
+	// Get block at that topoheight
+	return c.GetBlockByNumber(ctx, info.TopoHeight)
 }
 
-// GetNetworkInfo returns network information
+// GetNetworkInfo returns network information using get_info and p2p_status
 func (c *TOSClient) GetNetworkInfo(ctx context.Context) (*NetworkInfo, error) {
-	// Get block number
-	heightResult, err := c.call(ctx, "tos_blockNumber")
+	// Get node info
+	infoResult, err := c.call(ctx, "get_info", nil)
 	if err != nil {
 		return nil, err
 	}
 
-	var heightHex string
-	json.Unmarshal(heightResult, &heightHex)
-	var height uint64
-	fmt.Sscanf(heightHex, "0x%x", &height)
+	var info GetInfoResult
+	if err := json.Unmarshal(infoResult, &info); err != nil {
+		return nil, err
+	}
 
-	// Get latest block for difficulty
-	block, err := c.GetLatestBlock(ctx)
+	// Get p2p status
+	p2pResult, err := c.call(ctx, "p2p_status", nil)
 	if err != nil {
 		return nil, err
 	}
 
-	// Get peer count
-	peerResult, err := c.call(ctx, "net_peerCount")
-	if err != nil {
+	var p2p P2pStatusResult
+	if err := json.Unmarshal(p2pResult, &p2p); err != nil {
 		return nil, err
 	}
-	var peerHex string
-	json.Unmarshal(peerResult, &peerHex)
-	var peerCount int
-	fmt.Sscanf(peerHex, "0x%x", &peerCount)
 
-	// Check syncing status
-	syncResult, err := c.call(ctx, "tos_syncing")
-	if err != nil {
-		return nil, err
-	}
-	syncing := string(syncResult) != "false"
-
-	// Get gas price
-	gasPriceResult, _ := c.call(ctx, "tos_gasPrice")
-	var gasPriceHex string
-	json.Unmarshal(gasPriceResult, &gasPriceHex)
-	var gasPrice uint64
-	fmt.Sscanf(gasPriceHex, "0x%x", &gasPrice)
+	// Determine if syncing
+	syncing := p2p.OurTopoHeight < p2p.BestTopoHeight
 
 	return &NetworkInfo{
-		Height:     height,
-		Difficulty: block.Difficulty,
-		PeerCount:  peerCount,
+		Height:     info.TopoHeight,
+		Difficulty: parseDifficulty(info.Difficulty),
+		PeerCount:  int(p2p.PeerCount),
 		Syncing:    syncing,
-		GasPrice:   gasPrice,
+		GasPrice:   0, // TOS has no gas
 	}, nil
 }
 
-// GetBalance returns account balance
+// GetBalance returns account balance using get_balance
 func (c *TOSClient) GetBalance(ctx context.Context, address string) (uint64, error) {
-	result, err := c.call(ctx, "tos_getBalance", address, "latest")
+	params := map[string]interface{}{
+		"address": address,
+		"asset":   NativeAssetHash,
+	}
+
+	result, err := c.call(ctx, "get_balance", params)
 	if err != nil {
 		return 0, err
 	}
 
-	var balanceHex string
-	if err := json.Unmarshal(result, &balanceHex); err != nil {
+	var balanceResult GetBalanceResult
+	if err := json.Unmarshal(result, &balanceResult); err != nil {
 		return 0, err
 	}
 
-	var balance uint64
-	fmt.Sscanf(balanceHex, "0x%x", &balance)
-	return balance, nil
+	return balanceResult.Balance, nil
 }
 
 // GetTransactionReceipt returns transaction receipt
+// Note: TOS uses different transaction model, this is a compatibility stub
 func (c *TOSClient) GetTransactionReceipt(ctx context.Context, txHash string) (*TxReceipt, error) {
-	result, err := c.call(ctx, "tos_getTransactionReceipt", txHash)
+	params := map[string]interface{}{
+		"hash": txHash,
+	}
+
+	result, err := c.call(ctx, "get_transaction", params)
 	if err != nil {
 		return nil, err
 	}
@@ -402,167 +532,115 @@ func (c *TOSClient) GetTransactionReceipt(ctx context.Context, txHash string) (*
 		return nil, nil
 	}
 
-	var receipt TxReceipt
-	if err := json.Unmarshal(result, &receipt); err != nil {
+	// Parse TOS transaction format and convert to receipt
+	var txData struct {
+		Hash       string `json:"hash"`
+		InBlock    string `json:"in_block_hash"`
+		TopoHeight uint64 `json:"topoheight"`
+	}
+	if err := json.Unmarshal(result, &txData); err != nil {
 		return nil, err
 	}
 
-	return &receipt, nil
+	return &TxReceipt{
+		TxHash:      txData.Hash,
+		BlockHash:   txData.InBlock,
+		BlockNumber: txData.TopoHeight,
+		Status:      1, // Assume success if we found it
+		GasUsed:     0, // TOS has no gas
+	}, nil
 }
 
 // SendRawTransaction broadcasts a signed transaction
+// Note: TOS uses different transaction format
 func (c *TOSClient) SendRawTransaction(ctx context.Context, signedTx string) (string, error) {
-	result, err := c.call(ctx, "tos_sendRawTransaction", signedTx)
+	params := map[string]interface{}{
+		"data": signedTx,
+	}
+
+	result, err := c.call(ctx, "submit_transaction", params)
 	if err != nil {
 		return "", err
 	}
 
-	var txHash string
-	if err := json.Unmarshal(result, &txHash); err != nil {
+	var success bool
+	if err := json.Unmarshal(result, &success); err != nil {
+		// Might return tx hash instead
+		var txHash string
+		if json.Unmarshal(result, &txHash) == nil {
+			return txHash, nil
+		}
 		return "", err
 	}
 
-	return txHash, nil
+	if success {
+		return "submitted", nil
+	}
+	return "", fmt.Errorf("transaction rejected")
 }
 
 // GetNonce returns account nonce
+// Note: TOS uses different nonce model
 func (c *TOSClient) GetNonce(ctx context.Context, address string) (uint64, error) {
-	result, err := c.call(ctx, "tos_getTransactionCount", address, "pending")
+	params := map[string]interface{}{
+		"address": address,
+	}
+
+	result, err := c.call(ctx, "get_nonce", params)
 	if err != nil {
 		return 0, err
 	}
 
-	var nonceHex string
-	if err := json.Unmarshal(result, &nonceHex); err != nil {
+	var nonceResult struct {
+		Nonce uint64 `json:"nonce"`
+	}
+	if err := json.Unmarshal(result, &nonceResult); err != nil {
 		return 0, err
 	}
 
-	var nonce uint64
-	fmt.Sscanf(nonceHex, "0x%x", &nonce)
-	return nonce, nil
+	return nonceResult.Nonce, nil
 }
 
 // EstimateGas estimates gas for a transaction
+// Note: TOS has no gas, returns 0
 func (c *TOSClient) EstimateGas(ctx context.Context, from, to string, value uint64) (uint64, error) {
-	tx := map[string]string{
-		"from":  from,
-		"to":    to,
-		"value": fmt.Sprintf("0x%x", value),
-	}
-
-	result, err := c.call(ctx, "tos_estimateGas", tx)
-	if err != nil {
-		return 0, err
-	}
-
-	var gasHex string
-	if err := json.Unmarshal(result, &gasHex); err != nil {
-		return 0, err
-	}
-
-	var gas uint64
-	fmt.Sscanf(gasHex, "0x%x", &gas)
-	return gas, nil
+	return 0, nil // TOS has no gas
 }
 
 // SendTransaction creates and sends a payment transaction
-// Note: In production, this requires proper wallet key management
-// and transaction signing. This implementation uses eth_sendTransaction
-// which requires the node to have the pool's account unlocked.
+// Note: TOS requires proper wallet integration for transactions
 func (c *TOSClient) SendTransaction(ctx context.Context, to string, amount uint64) (string, error) {
-	// Get gas price
-	gasPrice, err := c.GetGasPrice(ctx)
-	if err != nil {
-		return "", fmt.Errorf("failed to get gas price: %w", err)
-	}
-
-	// Estimate gas
-	// For simple transfers, use default gas limit
-	gasLimit := uint64(21000)
-
-	tx := map[string]string{
-		"to":       to,
-		"value":    fmt.Sprintf("0x%x", amount),
-		"gas":      fmt.Sprintf("0x%x", gasLimit),
-		"gasPrice": fmt.Sprintf("0x%x", gasPrice),
-	}
-
-	result, err := c.call(ctx, "tos_sendTransaction", tx)
-	if err != nil {
-		return "", fmt.Errorf("failed to send transaction: %w", err)
-	}
-
-	var txHash string
-	if err := json.Unmarshal(result, &txHash); err != nil {
-		return "", fmt.Errorf("failed to parse tx hash: %w", err)
-	}
-
-	return txHash, nil
+	// TOS transactions require wallet signing
+	// This is a placeholder - real implementation needs wallet integration
+	return "", fmt.Errorf("SendTransaction requires wallet integration - use external wallet for payouts")
 }
 
 // GetGasPrice returns current gas price
+// Note: TOS has no gas, returns 0
 func (c *TOSClient) GetGasPrice(ctx context.Context) (uint64, error) {
-	result, err := c.call(ctx, "tos_gasPrice")
-	if err != nil {
-		return 0, err
-	}
-
-	var gasPriceHex string
-	if err := json.Unmarshal(result, &gasPriceHex); err != nil {
-		return 0, err
-	}
-
-	var gasPrice uint64
-	fmt.Sscanf(gasPriceHex, "0x%x", &gasPrice)
-	return gasPrice, nil
+	return 0, nil // TOS has no gas
 }
 
-// GetBlockTxFees calculates total transaction fees for a block
+// GetBlockTxFees returns total transaction fees for a block
 func (c *TOSClient) GetBlockTxFees(ctx context.Context, blockNumber uint64) (uint64, error) {
-	// Get block with full transactions
-	result, err := c.call(ctx, "tos_getBlockByNumber", fmt.Sprintf("0x%x", blockNumber), true)
-	if err != nil {
+	block, err := c.GetBlockByNumber(ctx, blockNumber)
+	if err != nil || block == nil {
 		return 0, err
 	}
-
-	if string(result) == "null" {
-		return 0, nil
-	}
-
-	// Parse block with transactions
-	var blockData struct {
-		Transactions []struct {
-			Hash     string `json:"hash"`
-			GasPrice string `json:"gasPrice"`
-		} `json:"transactions"`
-	}
-	if err := json.Unmarshal(result, &blockData); err != nil {
-		return 0, err
-	}
-
-	var totalFees uint64
-	for _, tx := range blockData.Transactions {
-		// Get receipt for actual gas used
-		receipt, err := c.GetTransactionReceipt(ctx, tx.Hash)
-		if err != nil || receipt == nil {
-			continue
-		}
-
-		var gasPrice uint64
-		fmt.Sscanf(tx.GasPrice, "0x%x", &gasPrice)
-
-		totalFees += receipt.GasUsed * gasPrice
-	}
-
-	return totalFees, nil
+	return block.TxFees, nil
 }
 
 // SearchBlockByHash searches for a block hash in a range of heights
 // Used for deep orphan detection - searches ±searchRange blocks
 func (c *TOSClient) SearchBlockByHash(ctx context.Context, targetHash string, centerHeight uint64, searchRange int) (*BlockInfo, error) {
-	// Search from center outward
+	// First try direct hash lookup
+	block, err := c.GetBlockByHash(ctx, targetHash)
+	if err == nil && block != nil {
+		return block, nil
+	}
+
+	// Fall back to range search
 	for offset := 0; offset <= searchRange; offset++ {
-		// Check center + offset
 		if offset >= 0 {
 			height := centerHeight + uint64(offset)
 			block, err := c.GetBlockByNumber(ctx, height)
@@ -571,7 +649,6 @@ func (c *TOSClient) SearchBlockByHash(ctx context.Context, targetHash string, ce
 			}
 		}
 
-		// Check center - offset (skip 0 to avoid duplicate)
 		if offset > 0 && centerHeight >= uint64(offset) {
 			height := centerHeight - uint64(offset)
 			block, err := c.GetBlockByNumber(ctx, height)
@@ -591,7 +668,5 @@ func (c *TOSClient) GetBlockRewardWithFees(ctx context.Context, blockNumber uint
 		return 0, 0, err
 	}
 
-	txFees, _ := c.GetBlockTxFees(ctx, blockNumber)
-
-	return block.Reward, txFees, nil
+	return block.Reward, block.TxFees, nil
 }

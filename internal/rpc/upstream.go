@@ -429,6 +429,14 @@ func (m *UpstreamManager) CallWithFailover(fn func(*TOSClient) error) error {
 	return err
 }
 
+// SetMinerAddress sets the miner address on all upstream clients
+// This is needed for get_block_template RPC calls
+func (m *UpstreamManager) SetMinerAddress(address string) {
+	for _, u := range m.upstreams {
+		u.client.SetMinerAddress(address)
+	}
+}
+
 // UpstreamCount returns the number of configured upstreams
 func (m *UpstreamManager) UpstreamCount() int {
 	return len(m.upstreams)
