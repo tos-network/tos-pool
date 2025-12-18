@@ -92,7 +92,19 @@ func main() {
 
 	// Initialize policy server for security
 	policyConfig := policy.DefaultConfig()
-	// TODO: Load policy config from config file
+	// Apply security settings from config file
+	if cfg.Security.MaxConnectionsPerIP > 0 {
+		policyConfig.ConnectionLimit = int32(cfg.Security.MaxConnectionsPerIP)
+	}
+	if cfg.Security.BanThreshold > 0 {
+		policyConfig.CheckThreshold = int32(cfg.Security.BanThreshold)
+	}
+	if cfg.Security.BanDuration > 0 {
+		policyConfig.BanTimeout = cfg.Security.BanDuration
+	}
+	if cfg.Security.RateLimitShares > 0 {
+		policyConfig.MaxScore = int32(cfg.Security.RateLimitShares)
+	}
 	policyServer = policy.NewPolicyServer(policyConfig, redis)
 	policyServer.Start()
 
