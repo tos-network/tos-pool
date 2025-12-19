@@ -31,25 +31,23 @@ func NewWalletClient(endpoint, username, password string) *WalletClient {
 	}
 }
 
+// NativeAsset is the asset hash for the native TOS token.
+const NativeAsset = "0000000000000000000000000000000000000000000000000000000000000000"
+
 // TransferDestination represents a single transfer destination.
 type TransferDestination struct {
-	Address   string `json:"address"`
-	Amount    uint64 `json:"amount"`
-	Asset     string `json:"asset,omitempty"`     // Optional, defaults to TOS
-	ExtraData []byte `json:"extra_data,omitempty"` // Optional extra data
+	Destination string `json:"destination"`          // Recipient address
+	Amount      uint64 `json:"amount"`               // Amount in atomic units
+	Asset       string `json:"asset"`                // Asset hash (use NativeAsset for TOS)
+	ExtraData   []byte `json:"extra_data,omitempty"` // Optional extra data
 }
 
 // BuildTransactionParams contains parameters for building a transaction.
 type BuildTransactionParams struct {
-	TxType    TransactionType       `json:"tx_type"`
-	Broadcast bool                  `json:"broadcast"`
-	TxAsHex   bool                  `json:"tx_as_hex,omitempty"`
-	Fee       *FeeParams            `json:"fee,omitempty"`
-}
-
-// TransactionType represents the type of transaction.
-type TransactionType struct {
-	Transfers []TransferDestination `json:"transfers,omitempty"`
+	Transfers []TransferDestination `json:"transfers"`           // List of transfers
+	Broadcast bool                  `json:"broadcast"`           // Whether to broadcast TX
+	TxAsHex   bool                  `json:"tx_as_hex,omitempty"` // Return TX as hex
+	Fee       *FeeParams            `json:"fee,omitempty"`       // Optional fee settings
 }
 
 // FeeParams represents fee configuration.
@@ -107,10 +105,8 @@ func (w *WalletClient) call(ctx context.Context, method string, params interface
 
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	// Add basic auth if credentials are provided
-	if w.username != "" || w.password != "" {
-		httpReq.SetBasicAuth(w.username, w.password)
-	}
+	// Always add basic auth - wallet requires it even with empty credentials
+	httpReq.SetBasicAuth(w.username, w.password)
 
 	resp, err := w.client.Do(httpReq)
 	if err != nil {
@@ -187,9 +183,7 @@ func (w *WalletClient) IsOnline(ctx context.Context) (bool, error) {
 // BuildTransaction builds and optionally broadcasts a transaction.
 func (w *WalletClient) BuildTransaction(ctx context.Context, destinations []TransferDestination, broadcast bool) (*TransactionResponse, error) {
 	params := BuildTransactionParams{
-		TxType: TransactionType{
-			Transfers: destinations,
-		},
+		Transfers: destinations,
 		Broadcast: broadcast,
 		TxAsHex:   false,
 	}
@@ -211,8 +205,9 @@ func (w *WalletClient) BuildTransaction(ctx context.Context, destinations []Tran
 func (w *WalletClient) Transfer(ctx context.Context, to string, amount uint64) (string, error) {
 	destinations := []TransferDestination{
 		{
-			Address: to,
-			Amount:  amount,
+			Destination: to,
+			Amount:      amount,
+			Asset:       NativeAsset,
 		},
 	}
 

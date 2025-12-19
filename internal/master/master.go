@@ -730,8 +730,9 @@ func (m *Master) processBatchPayout(miners []*storage.Miner) {
 		}
 
 		destinations = append(destinations, rpc.TransferDestination{
-			Address: miner.Address,
-			Amount:  payout,
+			Destination: miner.Address,
+			Amount:      payout,
+			Asset:       rpc.NativeAsset,
 		})
 		payoutInfo = append(payoutInfo, struct {
 			address string
