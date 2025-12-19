@@ -6,6 +6,7 @@ bin/
 *.dll
 *.so
 *.dylib
+precomputed_tables_26.bin
 
 # Test binary
 *.test
