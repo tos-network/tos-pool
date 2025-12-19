@@ -577,6 +577,22 @@ func (m *Master) processBlocks() {
 			m.redis.MoveBlockToImmature(block)
 		}
 	}
+
+	// Also check immature blocks for maturation
+	immatureBlocks, err := m.redis.GetImmatureBlocks()
+	if err != nil {
+		util.Warnf("Failed to get immature blocks: %v", err)
+		return
+	}
+
+	for _, block := range immatureBlocks {
+		confirmations := currentHeight - block.Height
+		if confirmations >= m.cfg.Unlocker.MatureDepth {
+			util.Infof("Block %d matured with %d confirmations (reward: %d)",
+				block.Height, confirmations, block.Reward)
+			m.redis.MoveBlockToMatured(block)
+		}
+	}
 }
 
 // payoutLoop processes payments

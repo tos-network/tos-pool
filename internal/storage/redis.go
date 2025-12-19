@@ -180,6 +180,24 @@ func (r *RedisClient) GetCandidateBlocks() ([]*Block, error) {
 	return blocks, nil
 }
 
+// GetImmatureBlocks returns all immature blocks
+func (r *RedisClient) GetImmatureBlocks() ([]*Block, error) {
+	results, err := r.client.ZRange(r.ctx, keyBlocksImmature, 0, -1).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	blocks := make([]*Block, 0, len(results))
+	for _, result := range results {
+		var block Block
+		if err := json.Unmarshal([]byte(result), &block); err != nil {
+			continue
+		}
+		blocks = append(blocks, &block)
+	}
+	return blocks, nil
+}
+
 // MoveBlockToImmature moves a block from candidates to immature
 func (r *RedisClient) MoveBlockToImmature(block *Block) error {
 	block.Status = BlockStatusImmature
