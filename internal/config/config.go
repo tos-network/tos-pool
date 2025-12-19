@@ -144,6 +144,12 @@ type PayoutsConfig struct {
 	GasPrice          string        `mapstructure:"gas_price"`
 	WithdrawalFee     uint64        `mapstructure:"withdrawal_fee"`      // Fixed fee per withdrawal (in smallest unit)
 	WithdrawalFeeRate float64       `mapstructure:"withdrawal_fee_rate"` // Percentage fee (0.01 = 1%)
+
+	// Wallet RPC settings for sending payouts
+	WalletRPC      string `mapstructure:"wallet_rpc"`      // Wallet RPC endpoint (e.g., "127.0.0.1:8081")
+	WalletUser     string `mapstructure:"wallet_user"`     // Wallet RPC username (optional)
+	WalletPassword string `mapstructure:"wallet_password"` // Wallet RPC password (optional)
+	WalletNetwork  string `mapstructure:"wallet_network"`  // Network: mainnet, testnet, devnet
 }
 
 // APIConfig defines API server settings
@@ -294,6 +300,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("payouts.gas_price", "auto")
 	v.SetDefault("payouts.withdrawal_fee", 0)        // No fixed fee by default
 	v.SetDefault("payouts.withdrawal_fee_rate", 0.0) // No percentage fee by default
+	v.SetDefault("payouts.wallet_rpc", "")           // Wallet RPC endpoint
+	v.SetDefault("payouts.wallet_user", "")          // Wallet RPC username
+	v.SetDefault("payouts.wallet_password", "")      // Wallet RPC password
+	v.SetDefault("payouts.wallet_network", "devnet") // Default network
 
 	// API defaults
 	v.SetDefault("api.enabled", true)
@@ -367,6 +377,11 @@ func (c *Config) Validate() error {
 
 	if c.Payouts.Threshold == 0 {
 		return fmt.Errorf("payouts.threshold must be > 0")
+	}
+
+	// Wallet RPC is required when payouts are enabled
+	if c.Payouts.Enabled && c.Payouts.WalletRPC == "" {
+		return fmt.Errorf("payouts.wallet_rpc is required when payouts are enabled")
 	}
 
 	return nil

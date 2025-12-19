@@ -31,6 +31,7 @@ type Master struct {
 	redis    *storage.RedisClient
 	upstream *rpc.UpstreamManager
 	notifier *notify.Notifier
+	wallet   *rpc.WalletClient // Wallet RPC client for payouts
 
 	// Current state
 	currentHeight  uint64
@@ -105,11 +106,20 @@ func NewMaster(cfg *config.Config, redis *storage.RedisClient, upstream *rpc.Ups
 		PoolURL:      cfg.Notify.PoolURL,
 	}
 
+	// Initialize wallet client for payouts
+	var walletClient *rpc.WalletClient
+	if cfg.Payouts.Enabled && cfg.Payouts.WalletRPC != "" {
+		walletEndpoint := "http://" + cfg.Payouts.WalletRPC
+		walletClient = rpc.NewWalletClient(walletEndpoint, cfg.Payouts.WalletUser, cfg.Payouts.WalletPassword)
+		util.Infof("Wallet RPC client initialized: %s", walletEndpoint)
+	}
+
 	return &Master{
 		cfg:           cfg,
 		redis:         redis,
 		upstream:      upstream,
 		notifier:      notify.NewNotifier(notifyCfg),
+		wallet:        walletClient,
 		shareChan:     make(chan *ShareSubmission, 10000),
 		jobBacklog:    make(map[string]*Job),
 		jobUpdateChan: make(chan struct{}, 1),
@@ -678,65 +688,108 @@ func (m *Master) processPayouts() {
 	}
 }
 
-// processBatchPayout sends a batch of payments
+// processBatchPayout sends a batch of payments using the wallet RPC
 func (m *Master) processBatchPayout(miners []*storage.Miner) {
-	node := m.upstream.GetClient()
-	if node == nil {
-		util.Warn("Batch payout skipped: no upstream available")
+	// Check wallet client is available
+	if m.wallet == nil {
+		util.Warn("Batch payout skipped: wallet client not configured")
+		return
+	}
+
+	// Verify wallet is online
+	online, err := m.wallet.IsOnline(m.ctx)
+	if err != nil {
+		util.Warnf("Batch payout skipped: wallet connectivity check failed: %v", err)
+		return
+	}
+	if !online {
+		util.Warn("Batch payout skipped: wallet is offline")
 		return
 	}
 
 	// Calculate pool fee
 	feePercent := m.cfg.Pool.Fee / 100.0
 
+	// Build batch transfer destinations
+	var destinations []rpc.TransferDestination
+	var payoutInfo []struct {
+		address string
+		amount  uint64
+		payout  uint64
+	}
+
 	for _, miner := range miners {
 		amount := miner.Balance
 		fee := uint64(float64(amount) * feePercent)
 		payout := amount - fee
 
-		// 1. Move balance to pending (pre-deduct before sending)
+		// Move balance to pending (pre-deduct before sending)
 		if err := m.redis.MoveToPending(miner.Address, amount); err != nil {
 			util.Errorf("Failed to move balance to pending for %s: %v", miner.Address, err)
 			continue
 		}
 
-		util.Infof("Paying %d to %s (fee: %d)", payout, miner.Address[:16], fee)
+		destinations = append(destinations, rpc.TransferDestination{
+			Address: miner.Address,
+			Amount:  payout,
+		})
+		payoutInfo = append(payoutInfo, struct {
+			address string
+			amount  uint64
+			payout  uint64
+		}{miner.Address, amount, payout})
 
-		// 2. Send transaction
-		txHash, err := node.SendTransaction(m.ctx, miner.Address, payout)
-		if err != nil {
-			util.Errorf("Failed to send payment to %s: %v", miner.Address, err)
-			// Rollback: restore balance from pending
-			if rbErr := m.redis.RollbackPayment(miner.Address, amount); rbErr != nil {
-				util.Errorf("CRITICAL: Failed to rollback payment for %s: %v (original error: %v)",
-					miner.Address, rbErr, err)
+		util.Infof("Queued payout %d to %s (fee: %d)", payout, miner.Address[:16], fee)
+	}
+
+	if len(destinations) == 0 {
+		return
+	}
+
+	// Send batch transaction via wallet RPC
+	util.Infof("Sending batch payout to %d miners", len(destinations))
+	txHash, err := m.wallet.BatchTransfer(m.ctx, destinations)
+	if err != nil {
+		util.Errorf("Batch payout failed: %v", err)
+		// Rollback all pending balances
+		for _, info := range payoutInfo {
+			if rbErr := m.redis.RollbackPayment(info.address, info.amount); rbErr != nil {
+				util.Errorf("CRITICAL: Failed to rollback payment for %s: %v", info.address, rbErr)
 			} else {
-				util.Infof("Rolled back payment for %s", miner.Address[:16])
+				util.Infof("Rolled back payment for %s", info.address[:16])
 			}
-			continue
 		}
+		return
+	}
 
-		// 3. Wait for TX confirmation
-		confirmed, err := m.waitForTxConfirmation(txHash)
-		if err != nil || !confirmed {
-			util.Errorf("TX %s not confirmed for %s: %v", txHash, miner.Address, err)
-			// Rollback: restore balance from pending
-			if rbErr := m.redis.RollbackPayment(miner.Address, amount); rbErr != nil {
+	util.Infof("Batch payout TX submitted: %s", txHash)
+
+	// Wait for TX confirmation
+	confirmed, err := m.waitForTxConfirmation(txHash)
+	if err != nil || !confirmed {
+		util.Errorf("Batch TX %s not confirmed: %v", txHash, err)
+		// Rollback all pending balances
+		for _, info := range payoutInfo {
+			if rbErr := m.redis.RollbackPayment(info.address, info.amount); rbErr != nil {
 				util.Errorf("CRITICAL: Failed to rollback payment for %s: %v (tx: %s)",
-					miner.Address, rbErr, txHash)
+					info.address, rbErr, txHash)
 			} else {
-				util.Warnf("Rolled back unconfirmed payment for %s (tx: %s)", miner.Address[:16], txHash)
+				util.Warnf("Rolled back unconfirmed payment for %s (tx: %s)", info.address[:16], txHash)
 			}
-			continue
 		}
+		return
+	}
 
-		// 4. TX confirmed - finalize payment record
-		if err := m.redis.UpdateMinerBalance(miner.Address, amount, txHash); err != nil {
-			util.Errorf("Failed to finalize payment record for %s: %v", miner.Address, err)
+	// TX confirmed - finalize all payment records
+	for _, info := range payoutInfo {
+		if err := m.redis.UpdateMinerBalance(info.address, info.amount, txHash); err != nil {
+			util.Errorf("Failed to finalize payment record for %s: %v", info.address, err)
 		} else {
-			util.Infof("Payment confirmed: %d to %s (tx: %s)", payout, miner.Address[:16], txHash)
+			util.Infof("Payment confirmed: %d to %s (tx: %s)", info.payout, info.address[:16], txHash)
 		}
 	}
+
+	util.Infof("Batch payout completed: %d miners, TX: %s", len(payoutInfo), txHash)
 }
 
 // waitForTxConfirmation waits for a transaction to be mined

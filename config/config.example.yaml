@@ -65,9 +65,20 @@ payouts:
   enabled: true
   interval: 1h                  # Process every hour
   threshold: 100000000          # 0.1 TOS minimum (8 decimals)
-  max_addresses_per_tx: 100     # Max recipients per transaction
+  max_addresses_per_tx: 25      # Max recipients per batch transaction
   gas_limit: 21000
   gas_price: "auto"             # "auto" or fixed value in wei
+
+  # Wallet RPC settings (required for payouts)
+  # Start the wallet with RPC server:
+  #   ./tos_wallet --network testnet --wallet-path pool_wallet --password <pass> \
+  #                --rpc-bind-address 127.0.0.1:8081 --daemon-address http://127.0.0.1:8080 \
+  #                --interactive
+  # Then in the wallet prompt, run: start_rpc_server
+  wallet_rpc: "127.0.0.1:8081"  # Wallet RPC endpoint (host:port)
+  wallet_user: ""               # Wallet RPC username (optional)
+  wallet_password: ""           # Wallet RPC password (optional)
+  wallet_network: "testnet"     # Network: mainnet, testnet, devnet
 
 # API server
 api:
